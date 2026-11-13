@@ -1,16 +1,17 @@
 {
-  "name": "amazon-test",
+  "name": "amazon-shift-tracker",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "main": "Test.mjs",
+  "main": "tracker.mjs",
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "start": "node Test.mjs"
+    "start": "node tracker.mjs"
   },
   "dependencies": {
+    "better-sqlite3": "^11.0.0",
     "undici": "^6.21.0"
   }
 }
