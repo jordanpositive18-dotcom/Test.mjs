@@ -6,6 +6,33 @@ import { pathToFileURL } from 'node:url';
 
 const AMAZON_GRAPHQL_URL = 'https://www.jobsatamazon.co.uk/graphql';
 
+export const UK_HUB_SEARCH_TERMS = Object.freeze([
+  'Dartford',
+  'Tilbury',
+  'London',
+  'Dunfermline',
+  'Doncaster',
+  'Coventry',
+  'Manchester',
+  'Bristol',
+  'Birmingham',
+  'Glasgow',
+  'Edinburgh',
+  'Cardiff',
+  'Belfast',
+  'Leeds',
+  'Newcastle',
+  'Sheffield',
+  'Southampton',
+  'Liverpool',
+  'Nottingham',
+  'Leicester',
+  'Peterborough',
+  'Northampton',
+  'Milton Keynes',
+  'Swindon',
+]);
+
 export function createScanner(options = {}) {
 const {
   fetchImpl = fetch,
@@ -22,12 +49,14 @@ const {
   notificationMaxBackoffMs = 60 * 60 * 1000,
   amazonPageSize = 20,
   amazonMaxConcurrentRequests = 3,
+  amazonMinimumRequestIntervalMs = 4000,
   amazonRequestTimeoutMs = 15000,
   amazonMaxRequestAttempts = 3,
   amazonRetryBaseMs = 1000,
   amazonForbiddenCooldownMs = 15 * 60 * 1000,
   loopFailureRetryBaseMs = 1000,
   loopFailureRetryMaxMs = 60 * 1000,
+  jobSearchTerms = UK_HUB_SEARCH_TERMS,
   maxCyclesPerLoop = Infinity,
   clock = () => Date.now(),
   monotonicClock = () => performance.now(),
@@ -37,11 +66,22 @@ const {
 if (!Number.isInteger(amazonMaxConcurrentRequests) || amazonMaxConcurrentRequests < 1) {
   throw new RangeError('amazonMaxConcurrentRequests must be a positive integer');
 }
+if (!Number.isInteger(amazonMinimumRequestIntervalMs) || amazonMinimumRequestIntervalMs < 0) {
+  throw new RangeError('amazonMinimumRequestIntervalMs must be a non-negative integer');
+}
+if (
+  !Array.isArray(jobSearchTerms)
+  || jobSearchTerms.length === 0
+  || jobSearchTerms.some((term) => typeof term !== 'string' || !term.trim())
+) {
+  throw new TypeError('jobSearchTerms must be a non-empty array of strings');
+}
 if (maxCyclesPerLoop !== Infinity
   && (!Number.isInteger(maxCyclesPerLoop) || maxCyclesPerLoop < 1)) {
   throw new RangeError('maxCyclesPerLoop must be a positive integer or Infinity');
 }
 const url = options.url ?? AMAZON_GRAPHQL_URL;
+const uniqueJobSearchTerms = [...new Set(jobSearchTerms.map((term) => term.trim()))];
 const TG_TOKEN = telegramToken;
 const TG_CHAT_ID = telegramChatId;
 const db = suppliedDatabase ?? new Database(databasePath);
@@ -50,6 +90,26 @@ const nowIso = () => new Date(clock()).toISOString();
 let amazonCooldownUntil = 0;
 let activeAmazonRequests = 0;
 const amazonRequestWaiters = [];
+let nextAmazonRequestAt = 0;
+let amazonPacingQueue = Promise.resolve();
+
+async function waitForAmazonPacing() {
+  const previousRequest = amazonPacingQueue;
+  let releaseRequest;
+  amazonPacingQueue = new Promise((resolveRequest) => {
+    releaseRequest = resolveRequest;
+  });
+  await previousRequest;
+
+  try {
+    const delay = Math.max(0, nextAmazonRequestAt - clock());
+    if (delay > 0) await wait(delay);
+    nextAmazonRequestAt = Math.max(clock(), nextAmazonRequestAt)
+      + amazonMinimumRequestIntervalMs;
+  } finally {
+    releaseRequest();
+  }
+}
 
 class AmazonCooldownError extends Error {
   constructor(until) {
@@ -106,6 +166,7 @@ function withAmazonRequestSlot(operation) {
 
 function fetchAmazonOnce(requestUrl, requestOptions, metrics) {
   return withAmazonRequestSlot(async () => {
+    await waitForAmazonPacing();
     if (clock() < amazonCooldownUntil) {
       throw new AmazonCooldownError(amazonCooldownUntil);
     }
@@ -119,6 +180,10 @@ function fetchAmazonOnce(requestUrl, requestOptions, metrics) {
     });
     if (response.status === 403 || response.status === 429) {
       applyAmazonCooldown(response);
+      logger.warn(
+        `[Amazon] HTTP ${response.status}; pausing all scanner requests until `
+        + `${new Date(amazonCooldownUntil).toISOString()}.`,
+      );
       try {
         await response.body?.cancel?.();
       } catch {
@@ -631,8 +696,8 @@ const amazonHeaders = {
 };
 
 const JOB_SEARCH_QUERY = `
-  query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
-    searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+  query SearchJobCardsByLocation($request: SearchJobRequest!) {
+    searchJobCardsByLocation(request: $request) {
       nextToken
       jobCards {
         jobId
@@ -677,8 +742,22 @@ const SCHEDULE_SEARCH_QUERY = `
 function getGraphQLErrorMessage(payload) {
   const errors = Array.isArray(payload?.errors) ? payload.errors : [];
   return errors
-    .map((error) => error?.message)
-    .filter(Boolean)
+    .map((error) => {
+      const details = [String(error?.message ?? 'Unknown GraphQL error').slice(0, 500)];
+      const code = error?.extensions?.code ?? error?.extensions?.errorType;
+      if (typeof code === 'string' && code.length <= 120) details.push(`code=${code}`);
+      if (Array.isArray(error?.path)) {
+        details.push(`path=${error.path.map((part) => String(part).slice(0, 80)).join('.')}`);
+      }
+      if (Array.isArray(error?.locations)) {
+        const locations = error.locations
+          .slice(0, 4)
+          .map(({ line, column }) => `${Number(line) || '?'}:${Number(column) || '?'}`)
+          .join(',');
+        if (locations) details.push(`locations=${locations}`);
+      }
+      return details.join(' ');
+    })
     .join('; ');
 }
 
