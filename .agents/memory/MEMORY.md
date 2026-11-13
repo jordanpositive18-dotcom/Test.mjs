@@ -1,1 +1,2 @@
 - [Project change boundaries](project-boundaries.md) — Keep Amazon Shift Finder work separate from Auto Booker and production systems.
+- [UK hub-search direction](hub-search-direction.md) — User requested hub terms and gentle pacing; complete coverage and the real GraphQL contract still require evidence.

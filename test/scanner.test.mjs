@@ -90,6 +90,8 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
         logger: QUIET_LOGGER,
         amazonPageSize,
         amazonMaxConcurrentRequests,
+        amazonMinimumRequestIntervalMs: 0,
+        jobSearchTerms: ['London'],
         amazonMaxRequestAttempts,
         amazonForbiddenCooldownMs,
         telegramTimeoutMs,

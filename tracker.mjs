@@ -120,10 +120,10 @@ class AmazonCooldownError extends Error {
   }
 }
 
-function getRetryAfterMs(response) {
+function getRetryAfterMs(response, fallbackMs = 60 * 1000) {
   const value = response.headers?.get?.('retry-after')
     ?? response.headers?.['retry-after'];
-  if (value === undefined || value === null || value === '') return 60 * 1000;
+  if (value === undefined || value === null || value === '') return fallbackMs;
 
   const seconds = Number(value);
   if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
@@ -131,12 +131,12 @@ function getRetryAfterMs(response) {
   const retryAt = Date.parse(value);
   return Number.isFinite(retryAt)
     ? Math.max(0, retryAt - clock())
-    : 60 * 1000;
+    : fallbackMs;
 }
 
 function applyAmazonCooldown(response) {
   const delay = response.status === 403
-    ? amazonForbiddenCooldownMs
+    ? Math.max(amazonForbiddenCooldownMs, getRetryAfterMs(response, 0))
     : getRetryAfterMs(response);
   amazonCooldownUntil = Math.max(amazonCooldownUntil, clock() + delay);
   persistAmazonCooldownStmt.run(
@@ -166,6 +166,9 @@ function withAmazonRequestSlot(operation) {
 
 function fetchAmazonOnce(requestUrl, requestOptions, metrics) {
   return withAmazonRequestSlot(async () => {
+    if (clock() < amazonCooldownUntil) {
+      throw new AmazonCooldownError(amazonCooldownUntil);
+    }
     await waitForAmazonPacing();
     if (clock() < amazonCooldownUntil) {
       throw new AmazonCooldownError(amazonCooldownUntil);
@@ -695,8 +698,11 @@ const amazonHeaders = {
   'Referer': 'https://www.jobsatamazon.co.uk/',
 };
 
+// Input naming follows the supplied hub-search source. Its example has no
+// paginated response: retain the existing connection selection, but verify this
+// request/response contract against an authorized successful capture before release.
 const JOB_SEARCH_QUERY = `
-  query SearchJobCardsByLocation($request: SearchJobRequest!) {
+  query searchJobCardsByLocation($request: SearchJobRequest!) {
     searchJobCardsByLocation(request: $request) {
       nextToken
       jobCards {
@@ -752,7 +758,7 @@ function getGraphQLErrorMessage(payload) {
       if (Array.isArray(error?.locations)) {
         const locations = error.locations
           .slice(0, 4)
-          .map(({ line, column }) => `${Number(line) || '?'}:${Number(column) || '?'}`)
+          .map((location) => `${Number(location?.line) || '?'}:${Number(location?.column) || '?'}`)
           .join(',');
         if (locations) details.push(`locations=${locations}`);
       }
@@ -874,63 +880,62 @@ async function runNationwideScan(loopName) {
   let error = null;
   let jobPaginationComplete = false;
   let schedulePaginationComplete = true;
-  const seenTokens = new Set();
-  let nextToken = null;
 
   try {
-    while (true) {
-      const searchJobRequest = {
-        country: 'GB',
-        locale: 'en_GB',
-        keyWords: '',
-        pageSize: amazonPageSize,
-        ...(nextToken ? { nextToken } : {}),
-      };
-      const response = await fetchAmazon(url, {
-        method: 'POST',
-        headers: amazonHeaders,
-        body: JSON.stringify({
-          operationName: 'searchJobCardsByLocation',
-          query: JOB_SEARCH_QUERY,
-          variables: { searchJobRequest },
-        }),
-      }, metrics);
+    for (const searchTerm of uniqueJobSearchTerms) {
+      const seenTokens = new Set();
+      let nextToken = null;
+      while (true) {
+        const request = {
+          country: 'GB',
+          locale: 'en_GB',
+          query: searchTerm,
+          ...(nextToken ? { nextToken } : {}),
+        };
+        const response = await fetchAmazon(url, {
+          method: 'POST',
+          headers: amazonHeaders,
+          body: JSON.stringify({
+            operationName: 'searchJobCardsByLocation',
+            query: JOB_SEARCH_QUERY,
+            variables: { request },
+          }),
+        }, metrics);
 
-      if (response.status !== 200) {
-        throw createAmazonHttpError(response, 'nationwide job search');
-      }
-      const payload = await response.json();
-      const graphQLError = getGraphQLErrorMessage(payload);
-      if (graphQLError) {
-        throw new Error(`Amazon job search GraphQL error: ${graphQLError}`);
-      }
+        if (response.status !== 200) {
+          throw createAmazonHttpError(response, `job search for "${searchTerm}"`);
+        }
+        const payload = await response.json();
+        const graphQLError = getGraphQLErrorMessage(payload);
+        if (graphQLError) {
+          throw new Error(`Amazon job search GraphQL error for "${searchTerm}": ${graphQLError}`);
+        }
 
-      const result = payload?.data?.searchJobCardsByLocation;
-      const jobCards = Array.isArray(result)
-        ? result
-        : result?.jobCards;
-      if (!Array.isArray(jobCards)) {
-        throw new Error('Amazon job search response did not contain a jobCards list');
-      }
+        const result = payload?.data?.searchJobCardsByLocation;
+        const jobCards = Array.isArray(result)
+          ? result
+          : result?.jobCards;
+        if (!Array.isArray(jobCards)) {
+          throw new Error(`Amazon job search for "${searchTerm}" did not contain a jobCards list`);
+        }
 
-      metrics.jobPagesFetched += 1;
-      for (const job of jobCards) {
-        if (!job?.jobId) continue;
-        saveDiscoveredJob.immediate(job, nowIso());
-        foundJobs.set(job.jobId, job);
-      }
+        metrics.jobPagesFetched += 1;
+        for (const job of jobCards) {
+          if (!job?.jobId) continue;
+          saveDiscoveredJob.immediate(job, nowIso());
+          foundJobs.set(job.jobId, job);
+        }
 
-      const pageToken = Array.isArray(result) ? null : result?.nextToken;
-      if (!pageToken) {
-        jobPaginationComplete = true;
-        break;
+        const pageToken = Array.isArray(result) ? null : result?.nextToken;
+        if (!pageToken) break;
+        if (seenTokens.has(pageToken)) {
+          throw new Error(`Amazon job search returned a repeated pagination token for "${searchTerm}"`);
+        }
+        seenTokens.add(pageToken);
+        nextToken = pageToken;
       }
-      if (seenTokens.has(pageToken)) {
-        throw new Error('Amazon job search returned a repeated pagination token');
-      }
-      seenTokens.add(pageToken);
-      nextToken = pageToken;
     }
+    jobPaginationComplete = true;
   } catch (scanError) {
     error = scanError;
     logger.error(`❌ [${loopName}] Nationwide scan did not finish:`, scanError.message);
@@ -1017,7 +1022,7 @@ async function runSingleLoopPass(loopName, isRunning, setRunning) {
 
   setRunning(true);
   try {
-    logger.log(`[${loopName}] Starting an unfiltered nationwide UK job and schedule scan.`);
+    logger.log(`[${loopName}] Starting a UK hub-term scan across ${uniqueJobSearchTerms.length} terms.`);
     const result = await runNationwideScan(loopName);
     kickNotificationDelivery();
     return result;
@@ -1181,8 +1186,9 @@ async function runContinuousLoop(loopName, runPass) {
 function start() {
   if (loopsStarted) return { status: 'ALREADY_RUNNING', loops: 3 };
   logger.log(
-    `🚀 Starting exactly three simultaneous nationwide UK scan loops; `
-    + `maximum Amazon request concurrency=${amazonMaxConcurrentRequests}.`,
+    `🚀 Starting exactly three simultaneous UK hub-term scan loops; `
+    + `maximum Amazon request concurrency=${amazonMaxConcurrentRequests}; `
+    + `minimum shared request spacing=${amazonMinimumRequestIntervalMs}ms.`,
   );
   stopRequested = false;
   loopsStarted = true;
@@ -1193,7 +1199,7 @@ function start() {
   ].map(([loopName, runPass]) => runContinuousLoop(loopName, runPass));
 
   void sendTelegramAlert(
-    '🚀 *Nationwide UK Amazon Shift Tracker Online!*\nThree simultaneous scan loops initiated.',
+    '🚀 *UK Amazon Shift Tracker Online!*\nThree simultaneous hub-term scan loops initiated.',
   ).catch((error) => logger.error('⚠️ Startup Telegram alert failed:', error.message));
   return { status: 'STARTED', loops: 3 };
 }
