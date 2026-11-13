@@ -13,7 +13,7 @@ if (!auth || !proxyUrl) {
   process.exit(1);
 }
 
-// Clean proxy URL (handles accidental quotes or extra text)
+// Clean proxy URL (handles accidental quotes or extra spaces)
 proxyUrl = proxyUrl.replace(/["']/g, '').trim();
 const spaceIdx = proxyUrl.indexOf(' ');
 if (spaceIdx !== -1) {
@@ -27,7 +27,7 @@ if (!auth.startsWith('Bearer ') && !auth.startsWith('Basic ')) {
 const dispatcher = new ProxyAgent(proxyUrl);
 const CHECK_INTERVAL_MS = 60 * 1000; // Check every 60 seconds
 
-// 2. Initialize SQLite Database for Deduplication
+// 2. Initialize SQLite Database for Persistent Deduplication
 const db = new Database('database.sqlite');
 db.exec(`
   CREATE TABLE IF NOT EXISTS seen_schedules (
@@ -39,25 +39,39 @@ db.exec(`
 const checkStmt = db.prepare('SELECT id FROM seen_schedules WHERE id = ?');
 const insertStmt = db.prepare('INSERT INTO seen_schedules (id, discovered_at) VALUES (?, ?)');
 
-// 3. Telegram Notification Helper
+// 3. Telegram Message Formatter matching your exact layout
+function formatShiftAlert(shift) {
+  return `1️⃣ 📍 ${shift.location}
+📮 Postcode: ${shift.postcode}
+💰 Pay: £${shift.pay} /hr
+📅 Start Date: ${shift.startDate}
+📆 Working Days: ${shift.workingDays}
+⏰ Shift Time: ${shift.shiftTime}
+🕐 Hours/Week: ${shift.hoursPerWeek}`;
+}
+
+// 4. Telegram Notification Sender
 async function sendTelegramAlert(message) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
-    console.log('📱 [Telegram Alert - Mock]:', message);
+    console.log('📱 [Telegram Alert (Mock - Add credentials in Railway Variables to go live)]:\n', message);
     return;
   }
   try {
     const tgUrl = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-    await fetch(tgUrl, {
+    const res = await fetch(tgUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message, parse_mode: 'Markdown' })
+      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message })
     });
+    if (!res.ok) {
+      console.error(`⚠️ Telegram API returned status ${res.status}`);
+    }
   } catch (err) {
     console.error('⚠️ Failed to send Telegram notification:', err.message);
   }
 }
 
-// 4. Core Scanning Function
+// 5. Core Scanning Function
 async function scanShifts() {
   try {
     const res = await fetch(url, {
@@ -69,9 +83,9 @@ async function scanShifts() {
         'Origin': 'https://www.jobsatamazon.co.uk',
         'Referer': 'https://www.jobsatamazon.co.uk/',
       },
-      // GraphQL payload querying jobs/schedules
+      // Put your actual Amazon UK GraphQL query payload here
       body: JSON.stringify({ 
-        query: `query GetJobs { __typename }` 
+        query: `query SearchListings { ... }` 
       }),
       dispatcher,
     });
@@ -81,15 +95,17 @@ async function scanShifts() {
     if (res.status === 200) {
       const data = await res.json();
       
-      // TODO: Parse jobs and schedules from `data` response structure.
-      // Example loop simulation for discovered schedules:
+      // Example integration once you parse your schedules:
       // const discoveredSchedules = parseSchedulesFromResponse(data);
       // 
-      // for (const schedule of discoveredSchedules) {
-      //   const exists = checkStmt.get(schedule.id);
+      // for (const shift of discoveredSchedules) {
+      //   const exists = checkStmt.get(shift.id);
       //   if (!exists) {
-      //     insertStmt.run(schedule.id, new Date().toISOString());
-      //     await sendTelegramAlert(`🚨 **New Amazon Shift Found!**\nRole: ${schedule.title}\nDetails: ${schedule.details}`);
+      //     insertStmt.run(shift.id, new Date().toISOString());
+      //     
+      //     // Format and send using your custom template
+      //     const message = formatShiftAlert(shift);
+      //     await sendTelegramAlert(message);
       //   }
       // }
     } else {
@@ -100,7 +116,7 @@ async function scanShifts() {
   }
 }
 
-// 5. Continuous Loop Execution
+// 6. Continuous Loop Execution
 console.log('🚀 Starting 24/7 Amazon Shift Tracker on Railway...');
 await scanShifts();
 setInterval(scanShifts, CHECK_INTERVAL_MS);
