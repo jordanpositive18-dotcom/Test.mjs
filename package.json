@@ -1,8 +1,13 @@
 {
-  "name": "amazon-test",
+  "name": "test-mjs",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
+  "main": "Test.mjs",
   "scripts": {
-    "start": "node test.mjs"
+    "start": "node Test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
