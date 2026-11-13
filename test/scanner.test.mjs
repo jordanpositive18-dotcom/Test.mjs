@@ -194,6 +194,78 @@ test('successful delivery preserves the exact alert format and records sent time
   );
 });
 
+test('Loop 2 skips overlapping passes and accepts the next pass afterward', async (t) => {
+  const context = createContext(t);
+  let releaseFirstRequest;
+  const firstRequestGate = new Promise((resolveGate) => {
+    releaseFirstRequest = resolveGate;
+  });
+  let amazonCallCount = 0;
+  const fixture = context.createFixture({
+    amazonResponder: async () => {
+      amazonCallCount += 1;
+      if (amazonCallCount === 1) await firstRequestGate;
+      return response({ data: { searchScheduleCards: [] } });
+    },
+  });
+  fixture.scanner.db.prepare(
+    "INSERT INTO job_queue (job_id, region, status, discovered_at) VALUES ('JOB-OVERLAP', 'London', 'PENDING', 'test')",
+  ).run();
+
+  const firstPass = fixture.scanner.runLoop2Schedules();
+  assert.equal(amazonCallCount, 1);
+
+  await fixture.scanner.runLoop2Schedules();
+  assert.equal(amazonCallCount, 1);
+
+  releaseFirstRequest();
+  await firstPass;
+  assert.equal(
+    fixture.scanner.db.prepare(
+      "SELECT status FROM job_queue WHERE job_id = 'JOB-OVERLAP'",
+    ).get().status,
+    'PROCESSED',
+  );
+
+  await processJob(fixture, 'JOB-AFTER-OVERLAP');
+  assert.equal(amazonCallCount, 2);
+  assert.equal(
+    fixture.scanner.db.prepare(
+      "SELECT status FROM job_queue WHERE job_id = 'JOB-AFTER-OVERLAP'",
+    ).get().status,
+    'PROCESSED',
+  );
+});
+
+test('Loop 2 releases its guard after a processing error', async (t) => {
+  const context = createContext(t);
+  let amazonCallCount = 0;
+  const fixture = context.createFixture({
+    amazonResponder: async () => {
+      amazonCallCount += 1;
+      if (amazonCallCount === 1) throw new Error('mock schedule request failure');
+      return response({ data: { searchScheduleCards: [] } });
+    },
+  });
+
+  await processJob(fixture, 'JOB-ERROR');
+  assert.equal(
+    fixture.scanner.db.prepare(
+      "SELECT status FROM job_queue WHERE job_id = 'JOB-ERROR'",
+    ).get().status,
+    'FAILED',
+  );
+
+  await processJob(fixture, 'JOB-RECOVERS');
+  assert.equal(amazonCallCount, 2);
+  assert.equal(
+    fixture.scanner.db.prepare(
+      "SELECT status FROM job_queue WHERE job_id = 'JOB-RECOVERS'",
+    ).get().status,
+    'PROCESSED',
+  );
+});
+
 test('HTTP errors and Telegram ok:false remain pending and are not marked sent', async (t) => {
   const cases = [
     {

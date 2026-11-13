@@ -97,6 +97,7 @@ const upsertJobStmt = db.prepare(`
 const getPendingJobsStmt = db.prepare("SELECT job_id, region FROM job_queue WHERE status = 'PENDING' LIMIT 10");
 const markJobProcessedStmt = db.prepare("UPDATE job_queue SET status = 'PROCESSED' WHERE job_id = ?");
 const markJobFailedStmt = db.prepare("UPDATE job_queue SET status = 'FAILED' WHERE job_id = ?");
+let loop2Running = false;
 
 const insertFailedStmt = db.prepare('INSERT INTO failed_requests (task_type, payload, error, retry_count, last_tried) VALUES (?, ?, ?, ?, ?)');
 const getFailedStmt = db.prepare('SELECT * FROM failed_requests WHERE retry_count < 3 LIMIT 5');
@@ -374,8 +375,14 @@ async function runLoop1Discovery() {
 // LOOP 2: Schedule Processing & Detailed Retrieval
 // ----------------------------------------------------
 async function runLoop2Schedules() {
-  logger.log('⚡ [Loop 2] Processing pending job queue for schedule details...');
+  if (loop2Running) {
+    logger.log('⚡ [Loop 2] Skipping this pass because the previous pass is still running.');
+    return;
+  }
+
+  loop2Running = true;
   try {
+    logger.log('⚡ [Loop 2] Processing pending job queue for schedule details...');
     const pendingJobs = getPendingJobsStmt.all();
     if (pendingJobs.length === 0) {
       logger.log('⚡ [Loop 2] No pending jobs in queue.');
@@ -461,6 +468,8 @@ async function runLoop2Schedules() {
     await deliverPendingNotifications();
   } catch (error) {
     logger.error('❌ [Loop 2 fatal error]:', error.message);
+  } finally {
+    loop2Running = false;
   }
 }
 
