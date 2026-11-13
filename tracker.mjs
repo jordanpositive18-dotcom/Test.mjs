@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { fetch } from 'undici';
+import { fetch, ProxyAgent } from 'undici';
 
 // Initialize SQLite database (persisted on Railway volume or local file)
 const db = new Database('shift_tracker.db');
@@ -48,6 +48,15 @@ const stmtMarkAlertFailed = db.prepare(`
 // Configuration from environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const AMAZON_AUTH_TOKEN = process.env.AMAZON_AUTH_TOKEN || process.env.AUTHORIZATION;
+const PROXY_URL = process.env.SHIFT_PROXY_URL || process.env.PROXY_URL;
+
+// Configure Undici proxy agent if proxy is provided
+let dispatcher = undefined;
+if (PROXY_URL) {
+  dispatcher = new ProxyAgent(PROXY_URL);
+  console.log('[Bot] Configured proxy agent for secure requests.');
+}
 
 // --- ASYNCHRONOUS TELEGRAM WORKER (Prevents HTTP 429 Rate Limits) ---
 function startTelegramWorker() {
@@ -78,14 +87,14 @@ function startTelegramWorker() {
           console.log('[Telegram] Sent OK');
         } else if (res.status === 429) {
           console.warn('[Telegram] ⚠️ HTTP 429 rate limit hit. Backing off...');
-          break; // Stop loop temporarily to respect rate limit
+          break; 
         } else {
           const errText = await res.text();
           console.error(`[Telegram] ❌ API error (${res.status}): ${errText}`);
           stmtMarkAlertFailed.run(alert.id);
         }
 
-        // Safe pacing delay between outgoing messages (800ms)
+        // Safe 800ms spacing between outgoing telegram alerts
         await new Promise(resolve => setTimeout(resolve, 800));
       }
     } catch (err) {
@@ -98,6 +107,7 @@ function startTelegramWorker() {
 function handleDiscoveredSchedule(scheduleId, jobDetails) {
   const result = stmtClaimSchedule.run(scheduleId);
 
+  // Atomic SQLite check: returns 1 if this loop successfully claimed it first
   if (result.changes === 1) {
     const location = jobDetails.location || 'Unit A and B Woodlands Industrial Storage Estate Longtown';
     const postcode = jobDetails.postcode || 'CA6 5TR';
@@ -130,23 +140,93 @@ function handleDiscoveredSchedule(scheduleId, jobDetails) {
   }
 }
 
-// --- ORGANIC REQUEST JITTER ---
-async function randomizedDelay(minMs = 1500, maxMs = 4000) {
-  const jitter = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+// --- AMAZON GRAPHQL FEED FETCHER ---
+async function fetchAmazonJobFeed() {
+  const url = 'https://www.jobsatamazon.co.uk/graphql';
+  const query = `
+    query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+      searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+        nextToken
+        jobCards {
+          jobId
+          jobTitle
+          city
+          postalCode
+          locationName
+          scheduleCount
+          totalPayRateMax
+        }
+      }
+    }
+  `;
+
+  const variables = {
+    searchJobRequest: {
+      locale: 'en-GB',
+      country: 'United Kingdom',
+      keyWords: '',
+      equalFilters: [],
+      containFilters: [{ key: 'isPrivateSchedule', val: ['true', 'false'] }],
+      rangeFilters: [],
+      orFilters: [],
+      dateFilters: [],
+      sorters: [{ fieldName: 'totalPayRateMax', ascending: 'false' }],
+      pageSize: 100,
+      consolidateSchedule: true
+    }
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        'Origin': 'https://www.jobsatamazon.co.uk',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        ...(AMAZON_AUTH_TOKEN ? { 'Authorization': AMAZON_AUTH_TOKEN } : {})
+      },
+      body: JSON.stringify({ query, variables }),
+      ...(dispatcher ? { dispatcher } : {})
+    });
+
+    if (!res.ok) {
+      console.warn(`[Amazon API] HTTP ${res.status} response received.`);
+      return [];
+    }
+
+    const data = await res.json();
+    return data?.data?.searchJobCardsByLocation?.jobCards || [];
+  } catch (err) {
+    console.error('[Amazon API] Fetch exception:', err.message);
+    return [];
+  }
+}
+
+// --- ORGANIC REQUEST JITTER (3-5 seconds like Python loop sleeps) ---
+async function randomizedDelay() {
+  const jitter = Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000;
   await new Promise(resolve => setTimeout(resolve, jitter));
 }
 
-// --- MAIN SCANNER LOOP ---
-async function runScannerLoop(loopName, assignedHubs) {
-  console.log(`[${loopName}] Started scanning hubs:`, assignedHubs);
+// --- MAIN OVERLAPPING SCANNER LOOP ---
+async function runScannerLoop(loopName) {
+  console.log(`[${loopName}] Started nationwide feed scanning loop.`);
 
   while (true) {
     try {
-      for (const hub of assignedHubs) {
-        await randomizedDelay(2000, 5000);
+      const jobCards = await fetchAmazonJobFeed();
+      
+      // Process and evaluate job cards against target UK locations locally
+      for (const job of jobCards) {
+        // Example check: pass discovered schedules to atomic handler
+        // handleDiscoveredSchedule(job.jobId, job);
       }
+
+      await randomizedDelay();
     } catch (err) {
-      console.error(`[${loopName}] ⚠️ Scan error:`, err.message);
+      console.error(`[${loopName}] ⚠️ Loop error:`, err.message);
       await new Promise(resolve => setTimeout(resolve, 10000));
     }
   }
@@ -156,26 +236,22 @@ async function runScannerLoop(loopName, assignedHubs) {
 console.log('[Bot] Starting Amazon Shift Tracker (Node.js High-Speed Edition)...');
 console.log('[Activation] Runtime: Node.js ES Modules | Database: better-sqlite3 | Deduplication: Atomic SQLite Lock');
 console.log('[Bot] Targets: Carlisle, Northampton, Tilbury, Dartford, Enfield, Bow / Barking, Chingford, Harlow, Exeter, Poole, Preston, Croydon, Maidstone, London, Garden City, Birmingham, Neasden, West London, Haringey, Dunfermline, Bromley, Orpington, Doncaster, Hayes');
-console.log('[Bot] Connection: Residential Proxy / undici dispatcher');
-console.log('[Watchdog] Started - monitoring 3 loops with staggered delays.');
+console.log('[Watchdog] Started - monitoring 3 global overlapping loops with staggered delays.');
 
 startTelegramWorker();
 
-// Partition hubs and start loops with staggered delays like your Python monitor
-const totalHubs = ['Carlisle', 'Northampton', 'Tilbury', 'Dartford', 'Enfield', 'Bow / Barking', 'Chingford', 'Harlow', 'Exeter', 'Poole', 'Preston', 'Croydon', 'Maidstone', 'London', 'Garden City', 'Birmingham', 'Neasden', 'West London', 'Haringey', 'Dunfermline', 'Bromley', 'Orpington', 'Doncaster', 'Hayes'];
-const chunkSize = Math.ceil(totalHubs.length / 3);
-
+// 3 Overlapping Loops checking the full nationwide feed concurrently
 console.log('[Loop-1] Started.');
-runScannerLoop('Loop-1', totalHubs.slice(0, chunkSize));
+runScannerLoop('Loop-1');
 
 console.log('[Loop-2] Starting in 5s...');
 setTimeout(() => {
   console.log('[Loop-2] Started.');
-  runScannerLoop('Loop-2', totalHubs.slice(chunkSize, chunkSize * 2));
+  runScannerLoop('Loop-2');
 }, 5000);
 
 console.log('[Loop-3] Starting in 10s...');
 setTimeout(() => {
   console.log('[Loop-3] Started.');
-  runScannerLoop('Loop-3', totalHubs.slice(chunkSize * 2));
+  runScannerLoop('Loop-3');
 }, 10000);
