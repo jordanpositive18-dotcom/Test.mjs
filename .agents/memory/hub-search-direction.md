@@ -1,10 +1,10 @@
 ---
-name: UK hub-search direction
-description: User-requested change from blank nationwide queries to supplied fulfillment-hub search terms.
+name: UK request scope
+description: Latest user direction supersedes hub-term requests with minimal country-wide GraphQL inputs.
 ---
 
-The user requested discovery using their supplied UK fulfillment-hub search terms with gentle request pacing, replacing blank queries.
+The user superseded the earlier hub-term approach: job inputs must contain only country "United Kingdom", locale "en-GB", and optional nextToken; schedule inputs additionally contain jobId.
 
-**Why:** The user supplied replacement production source after reporting GraphQL input failures. This changes the earlier maximum-speed, unfiltered-feed direction.
+**Why:** The user reported GraphQL rejecting undefined SearchJobRequest fields and explicitly requested removing query and other extra fields.
 
-**How to apply:** Preserve the shared notification queue and independent loops while integrating this approach. Do not claim that hub-term searches cover every UK listing, or that the GraphQL rejection is fixed, without successful request/response evidence. The supplied source does not demonstrate a paginated response contract.
+**How to apply:** Do not reintroduce hub terms or unsupported filters. Preserve request pacing, cooldowns, independent loops, and the notification queue. Do not claim live schema compatibility or complete UK coverage from offline mocks alone.
