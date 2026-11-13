@@ -698,12 +698,11 @@ const amazonHeaders = {
   'Referer': 'https://www.jobsatamazon.co.uk/',
 };
 
-// Input naming follows the supplied hub-search source. Its example has no
-// paginated response: retain the existing connection selection, but verify this
+// Retain the existing paginated connection selection, but verify this
 // request/response contract against an authorized successful capture before release.
 const JOB_SEARCH_QUERY = `
-  query searchJobCardsByLocation($request: SearchJobRequest!) {
-    searchJobCardsByLocation(request: $request) {
+  query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+    searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
       nextToken
       jobCards {
         jobId
@@ -886,7 +885,7 @@ async function runNationwideScan(loopName) {
       const seenTokens = new Set();
       let nextToken = null;
       while (true) {
-        const request = {
+        const searchJobRequest = {
           country: 'United Kingdom',
           locale: 'en-GB',
           query: searchTerm,
@@ -898,7 +897,7 @@ async function runNationwideScan(loopName) {
           body: JSON.stringify({
             operationName: 'searchJobCardsByLocation',
             query: JOB_SEARCH_QUERY,
-            variables: { request },
+            variables: { searchJobRequest },
           }),
         }, metrics);
 

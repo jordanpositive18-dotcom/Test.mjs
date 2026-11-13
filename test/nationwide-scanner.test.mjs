@@ -153,17 +153,19 @@ test('all three loops independently search the same complete hub list without bl
   assert.equal(new Set(UK_HUB_SEARCH_TERMS).size, UK_HUB_SEARCH_TERMS.length);
   for (let index = 0; index < searches.length; index += 1) {
     const { request } = searches[index];
-    assert.deepEqual(request.variables.request, {
+    assert.deepEqual(request.variables.searchJobRequest, {
       country: 'United Kingdom',
       locale: 'en-GB',
       query: UK_HUB_SEARCH_TERMS[index % UK_HUB_SEARCH_TERMS.length],
     });
     assert.match(request.query, /nextToken/);
     assert.match(request.query, /jobCards/);
-    assert.match(request.query, /searchJobCardsByLocation\(request: \$request\)/);
-    assert.equal('city' in request.variables.request, false);
-    assert.equal('postcode' in request.variables.request, false);
-    assert.equal('postalCode' in request.variables.request, false);
+    assert.match(request.query, /\$searchJobRequest: SearchJobRequest!/);
+    assert.match(request.query, /searchJobCardsByLocation\(searchJobRequest: \$searchJobRequest\)/);
+    assert.equal('request' in request.variables, false);
+    assert.equal('city' in request.variables.searchJobRequest, false);
+    assert.equal('postcode' in request.variables.searchJobRequest, false);
+    assert.equal('postalCode' in request.variables.searchJobRequest, false);
   }
   assert.deepEqual(
     fixture.scanner.getScanRuns().map((run) => [run.loop_name, run.status]),
@@ -234,10 +236,10 @@ test('nationwide job search follows nextToken pages and records each page', asyn
   const fixture = context.createFixture({
     amazonPageSize: 2,
     jobSearchResponder: async (request) => {
-      if (!request.variables.request.nextToken) {
+      if (!request.variables.searchJobRequest.nextToken) {
         return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PAGE-1' }], 'cursor-2');
       }
-      assert.equal(request.variables.request.nextToken, 'cursor-2');
+      assert.equal(request.variables.searchJobRequest.nextToken, 'cursor-2');
       return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PAGE-2' }]);
     },
   });
@@ -247,7 +249,7 @@ test('nationwide job search follows nextToken pages and records each page', asyn
   assert.deepEqual(
     fixture.amazonCalls
       .filter(({ request }) => request.operationName === 'searchJobCardsByLocation')
-      .map(({ request }) => request.variables.request.nextToken ?? null),
+      .map(({ request }) => request.variables.searchJobRequest.nextToken ?? null),
     [null, 'cursor-2'],
   );
   assert.equal(result.status, 'COMPLETE');
@@ -267,7 +269,7 @@ test('scan metrics record requests, pages, duration, and completed-scan spacing'
       error() {},
     },
     jobSearchResponder: async (request) => (
-      request.variables.request.nextToken
+      request.variables.searchJobRequest.nextToken
         ? jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-METRICS-2' }])
         : jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-METRICS-1' }], 'metrics-page-2')
     ),
@@ -482,7 +484,7 @@ test('a partial paginated scan is recorded and completed on a later run', async 
   let pageTwoAttempt = 0;
   const firstProcess = context.createFixture({
     jobSearchResponder: async (request) => {
-      if (!request.variables.request.nextToken) {
+      if (!request.variables.searchJobRequest.nextToken) {
         return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PARTIAL-1' }], 'cursor-2');
       }
       pageTwoAttempt += 1;
@@ -499,7 +501,7 @@ test('a partial paginated scan is recorded and completed on a later run', async 
 
   const restarted = context.createFixture({
     jobSearchResponder: async (request) => {
-      if (!request.variables.request.nextToken) {
+      if (!request.variables.searchJobRequest.nextToken) {
         return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PARTIAL-1' }], 'cursor-2');
       }
       return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PARTIAL-2' }]);
@@ -670,7 +672,7 @@ test('hub searches reset pagination per term and deduplicate overlapping job res
   const context = createContext(t);
   const fixture = context.createFixture({
     jobSearchTerms: ['Dartford', 'Tilbury', ' Dartford '],
-    jobSearchResponder: async ({ variables: { request } }) => (
+    jobSearchResponder: async ({ variables: { searchJobRequest: request } }) => (
       request.nextToken
         ? jobPage([{ ...DEFAULT_JOB, jobId: `JOB-${request.query}` }])
         : jobPage([DEFAULT_JOB], 'shared-cursor')
@@ -683,8 +685,8 @@ test('hub searches reset pagination per term and deduplicate overlapping job res
   const requests = fixture.amazonCalls
     .filter(({ request }) => request.operationName === 'searchJobCardsByLocation')
     .map(({ request }) => [
-      request.variables.request.query,
-      request.variables.request.nextToken ?? null,
+      request.variables.searchJobRequest.query,
+      request.variables.searchJobRequest.nextToken ?? null,
     ]);
   assert.deepEqual(requests, [
     ['Dartford', null],
