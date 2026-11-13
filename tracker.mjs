@@ -25,21 +25,59 @@ if (!auth.startsWith('Bearer ') && !auth.startsWith('Basic ')) {
 }
 
 const dispatcher = new ProxyAgent(proxyUrl);
-const CHECK_INTERVAL_MS = 60 * 1000; // Check every 60 seconds
 
-// 2. Initialize SQLite Database for Persistent Deduplication
+// 2. Initialize Shared SQLite Database & Tables for Nationwide 3-Loop Architecture
 const db = new Database('database.sqlite');
 db.exec(`
   CREATE TABLE IF NOT EXISTS seen_schedules (
     id TEXT PRIMARY KEY,
     discovered_at TEXT
-  )
+  );
+
+  CREATE TABLE IF NOT EXISTS job_queue (
+    job_id TEXT PRIMARY KEY,
+    region TEXT,
+    status TEXT DEFAULT 'PENDING',
+    discovered_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS failed_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_type TEXT,
+    payload TEXT,
+    error TEXT,
+    retry_count INTEGER DEFAULT 0,
+    last_tried TEXT
+  );
 `);
 
-const checkStmt = db.prepare('SELECT id FROM seen_schedules WHERE id = ?');
-const insertStmt = db.prepare('INSERT INTO seen_schedules (id, discovered_at) VALUES (?, ?)');
+const checkSeenStmt = db.prepare('SELECT id FROM seen_schedules WHERE id = ?');
+const insertSeenStmt = db.prepare('INSERT INTO seen_schedules (id, discovered_at) VALUES (?, ?)');
 
-// 3. Telegram Message Formatter matching your exact layout
+const upsertJobStmt = db.prepare(`
+  INSERT INTO job_queue (job_id, region, status, discovered_at) 
+  VALUES (?, ?, 'PENDING', ?) 
+  ON CONFLICT(job_id) DO UPDATE SET status = CASE WHEN job_queue.status = 'PROCESSED' THEN 'PROCESSED' ELSE 'PENDING' END
+`);
+
+const getPendingJobsStmt = db.prepare("SELECT job_id, region FROM job_queue WHERE status = 'PENDING' LIMIT 10");
+const markJobProcessedStmt = db.prepare("UPDATE job_queue SET status = 'PROCESSED' WHERE job_id = ?");
+const markJobFailedStmt = db.prepare("UPDATE job_queue SET status = 'FAILED' WHERE job_id = ?");
+
+const insertFailedStmt = db.prepare('INSERT INTO failed_requests (task_type, payload, error, retry_count, last_tried) VALUES (?, ?, ?, ?, ?)');
+const getFailedStmt = db.prepare('SELECT * FROM failed_requests WHERE retry_count < 3 LIMIT 5');
+const updateFailedStmt = db.prepare('UPDATE failed_requests SET retry_count = retry_count + 1, last_tried = ? WHERE id = ?');
+const deleteFailedStmt = db.prepare('DELETE FROM failed_requests WHERE id = ?');
+
+// Nationwide UK regions & search hubs covering England, Scotland, Wales, and Northern Ireland
+const UK_REGIONS = [
+  "England", "Scotland", "Wales", "Northern Ireland",
+  "London", "Manchester", "Birmingham", "Glasgow", "Edinburgh", 
+  "Cardiff", "Belfast", "Bristol", "Leeds", "Newcastle", 
+  "Sheffield", "Southampton", "Liverpool", "Nottingham", "Leicester"
+];
+
+// 3. Telegram Message Formatter matching exact user layout
 function formatShiftAlert(shift) {
   return `1️⃣ 📍 ${shift.location}
 📮 Postcode: ${shift.postcode}
@@ -50,10 +88,9 @@ function formatShiftAlert(shift) {
 🕐 Hours/Week: ${shift.hoursPerWeek}`;
 }
 
-// 4. Telegram Notification Sender
 async function sendTelegramAlert(message) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
-    console.log('📱 [Telegram Alert (Mock - Credentials missing in Railway Variables)]:\n', message);
+    console.log('📱 [Telegram Mock Alert]:\n', message);
     return;
   }
   try {
@@ -63,64 +100,97 @@ async function sendTelegramAlert(message) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message })
     });
-    if (res.ok) {
-      console.log('✅ Telegram alert sent successfully!');
-    } else {
-      const errText = await res.text();
-      console.error(`⚠️ Telegram API returned status ${res.status}:`, errText);
+    if (!res.ok) {
+      console.error(`⚠️ Telegram API returned status ${res.status}`);
     }
   } catch (err) {
     console.error('⚠️ Failed to send Telegram notification:', err.message);
   }
 }
 
-// 5. Core Scanning & Parsing Logic
-async function scanShifts() {
-  try {
-    // Step A: Search for job cards by location
-    const jobSearchQuery = `
-      query SearchJobCardsByLocation($request: SearchJobRequest!) {
-        searchJobCardsByLocation(request: $request) {
-          jobId
-          __typename
-        }
-      }
-    `;
+// Common headers for Amazon GraphQL
+const amazonHeaders = {
+  'Content-Type': 'application/json',
+  'Authorization': auth,
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Origin': 'https://www.jobsatamazon.co.uk',
+  'Referer': 'https://www.jobsatamazon.co.uk/',
+};
 
-    const jobRes = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': auth,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Origin': 'https://www.jobsatamazon.co.uk',
-        'Referer': 'https://www.jobsatamazon.co.uk/',
-      },
-      body: JSON.stringify({
-        query: jobSearchQuery,
-        variables: {
-          request: {
-            country: "GB",
-            locale: "en_GB",
-            query: "Dartford" // Target location / query filter
+// ----------------------------------------------------
+// LOOP 1: Nationwide Job Discovery & Pagination
+// ----------------------------------------------------
+async function runLoop1Discovery() {
+  console.log('🌍 [Loop 1] Starting nationwide UK job discovery scan across regions...');
+  for (const region of UK_REGIONS) {
+    try {
+      const jobSearchQuery = `
+        query SearchJobCardsByLocation($request: SearchJobRequest!) {
+          searchJobCardsByLocation(request: $request) {
+            jobId
+            __typename
           }
         }
-      }),
-      dispatcher,
-    });
+      `;
 
-    console.log(`[${new Date().toISOString()}] Job Search Scan status: ${jobRes.status}`);
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: amazonHeaders,
+        body: JSON.stringify({
+          query: jobSearchQuery,
+          variables: {
+            request: {
+              country: "GB",
+              locale: "en_GB",
+              query: region
+            }
+          }
+        }),
+        dispatcher,
+      });
 
-    if (jobRes.status === 200) {
-      const jobData = await jobRes.json();
-      const jobCards = jobData?.data?.searchJobCardsByLocation || [];
-      console.log(`🔍 Found ${jobCards.length} job card(s). Fetching schedules...`);
+      if (res.status === 200) {
+        const data = await res.json();
+        const jobCards = data?.data?.searchJobCardsByLocation || [];
+        const now = new Date().toISOString();
 
-      // Step B: For each job ID, fetch schedule cards
-      for (const job of jobCards) {
-        const jobId = job.jobId;
-        if (!jobId) continue;
+        let addedCount = 0;
+        for (const job of jobCards) {
+          if (job && job.jobId) {
+            upsertJobStmt.run(job.jobId, region, now);
+            addedCount++;
+          }
+        }
+        console.log(`🌍 [Loop 1] Region [${region}]: Found ${jobCards.length} jobs (${addedCount} queued/updated).`);
+      } else {
+        const errText = await res.text();
+        console.warn(`⚠️ [Loop 1] Region [${region}] returned status ${res.status}`);
+        insertFailedStmt.run('LOOP1_DISCOVERY', JSON.stringify({ region }), `HTTP ${res.status}: ${errText}`, 0, new Date().toISOString());
+      }
+    } catch (error) {
+      console.error(`❌ [Loop 1 error in region ${region}]:`, error.message);
+      insertFailedStmt.run('LOOP1_DISCOVERY', JSON.stringify({ region }), error.message, 0, new Date().toISOString());
+    }
 
+    // Controlled pacing between region requests
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+}
+
+// ----------------------------------------------------
+// LOOP 2: Schedule Processing & Detailed Retrieval
+// ----------------------------------------------------
+async function runLoop2Schedules() {
+  console.log('⚡ [Loop 2] Processing pending job queue for schedule details...');
+  try {
+    const pendingJobs = getPendingJobsStmt.all();
+    if (pendingJobs.length === 0) {
+      console.log('⚡ [Loop 2] No pending jobs in queue.');
+      return;
+    }
+
+    for (const job of pendingJobs) {
+      try {
         const scheduleQuery = `
           query SearchScheduleCards($request: SearchScheduleRequest!) {
             searchScheduleCards(request: $request) {
@@ -137,20 +207,14 @@ async function scanShifts() {
           }
         `;
 
-        const schedRes = await fetch(url, {
+        const res = await fetch(url, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': auth,
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Origin': 'https://www.jobsatamazon.co.uk',
-            'Referer': 'https://www.jobsatamazon.co.uk/',
-          },
+          headers: amazonHeaders,
           body: JSON.stringify({
             query: scheduleQuery,
             variables: {
               request: {
-                jobId: jobId,
+                jobId: job.job_id,
                 country: "GB",
                 locale: "en_GB"
               }
@@ -159,51 +223,170 @@ async function scanShifts() {
           dispatcher,
         });
 
-        if (schedRes.status === 200) {
-          const schedData = await schedRes.json();
-          const schedules = schedData?.data?.searchScheduleCards || [];
+        if (res.status === 200) {
+          const data = await res.json();
+          const schedules = data?.data?.searchScheduleCards || [];
 
           for (const sch of schedules) {
-            const shiftId = sch.scheduleId || `${jobId}-${sch.startTime}`;
-            
-            // Check SQLite deduplication
-            const exists = checkStmt.get(shiftId);
-            if (!exists) {
-              // Save to SQLite so we never alert twice for the same shift
-              insertStmt.run(shiftId, new Date().toISOString());
+            const shiftId = sch.scheduleId || `${job.job_id}-${sch.startTime || 'unknown'}`;
+            const exists = checkSeenStmt.get(shiftId);
 
-              // Map properties to your exact template format
+            if (!exists) {
+              insertSeenStmt.run(shiftId, new Date().toISOString());
+
               const shiftInfo = {
-                location: sch.location || "London, England (Dartford area) DA17 6AS",
-                postcode: sch.postcode || "DA17 6AS",
+                location: sch.location || `UK Location (${job.region})`,
+                postcode: sch.postcode || "N/A",
                 pay: sch.basePay || "16.10",
-                startDate: sch.hireStartDate || "21 Nov 2026",
-                workingDays: sch.workingDays || "Sat, Sun, Mon, Tue, Wed",
-                shiftTime: `${sch.startTime || "7:00"} - ${sch.finishTime || "13:30"}`,
+                startDate: sch.hireStartDate || "Upcoming",
+                workingDays: sch.workingDays || "Flexible",
+                shiftTime: `${sch.startTime || "07:00"} - ${sch.finishTime || "15:30"}`,
                 hoursPerWeek: sch.hoursPerWeek || "30"
               };
 
-              const message = formatShiftAlert(shiftInfo);
-              await sendTelegramAlert(message);
-              console.log(`🚨 New shift detected and alert sent for ID: ${shiftId}`);
+              const alertMsg = formatShiftAlert(shiftInfo);
+              await sendTelegramAlert(alertMsg);
+              console.log(`🚨 [Loop 2] New shift discovered & alerted! ID: ${shiftId}`);
             }
           }
+
+          markJobProcessedStmt.run(job.job_id);
+        } else {
+          const errText = await res.text();
+          console.warn(`⚠️ [Loop 2] Job ${job.job_id} schedule fetch returned status ${res.status}`);
+          markJobFailedStmt.run(job.job_id);
+          insertFailedStmt.run('LOOP2_SCHEDULE', JSON.stringify({ jobId: job.job_id }), `HTTP ${res.status}: ${errText}`, 0, new Date().toISOString());
         }
+      } catch (err) {
+        console.error(`❌ [Loop 2 error for job ${job.job_id}]:`, err.message);
+        markJobFailedStmt.run(job.job_id);
+        insertFailedStmt.run('LOOP2_SCHEDULE', JSON.stringify({ jobId: job.job_id }), err.message, 0, new Date().toISOString());
       }
-    } else {
-      const errText = await jobRes.text();
-      console.warn(`⚠️ Non-200 status code during job scan: ${jobRes.status}`, errText);
+
+      // Pacing between schedule requests
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
   } catch (error) {
-    console.error('❌ Error during scan cycle:', error.message);
+    console.error('❌ [Loop 2 fatal error]:', error.message);
   }
 }
 
-// 6. Continuous Loop Execution
-console.log('🚀 Starting 24/7 Live Amazon Shift Tracker on Railway...');
+// ----------------------------------------------------
+// LOOP 3: Error Recovery, Failed Requests & Safe Retries
+// ----------------------------------------------------
+async function runLoop3Recovery() {
+  console.log('🛡️ [Loop 3] Checking error logs and retrying failed tasks safely...');
+  try {
+    const failedTasks = getFailedStmt.all();
+    if (failedTasks.length === 0) {
+      console.log('🛡️ [Loop 3] No failed tasks requiring retry.');
+      return;
+    }
 
-// Optional startup test message to verify Telegram connectivity
-await sendTelegramAlert("🚀 *Amazon Live Shift Tracker Online!*\nScanning every 60 seconds...");
+    for (const task of failedTasks) {
+      console.log(`🛡️ [Loop 3] Retrying failed task #${task.id} (${task.task_type})...`);
+      const payloadData = JSON.parse(task.payload || '{}');
+      const now = new Date().toISOString();
 
-await scanShifts();
-setInterval(scanShifts, CHECK_INTERVAL_MS);
+      try {
+        if (task.task_type === 'LOOP1_DISCOVERY') {
+          const region = payloadData.region;
+          const jobSearchQuery = `
+            query SearchJobCardsByLocation($request: SearchJobRequest!) {
+              searchJobCardsByLocation(request: $request) {
+                jobId
+                __typename
+              }
+            }
+          `;
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: amazonHeaders,
+            body: JSON.stringify({
+              query: jobSearchQuery,
+              variables: { request: { country: "GB", locale: "en_GB", query: region } }
+            }),
+            dispatcher
+          });
+          if (res.status === 200) {
+            const data = await res.json();
+            const jobCards = data?.data?.searchJobCardsByLocation || [];
+            for (const job of jobCards) {
+              if (job && job.jobId) upsertJobStmt.run(job.jobId, region, now);
+            }
+            deleteFailedStmt.run(task.id);
+            console.log(`✅ [Loop 3] Retry successful for region ${region}`);
+          } else {
+            updateFailedStmt.run(now, task.id);
+          }
+        } else if (task.task_type === 'LOOP2_SCHEDULE') {
+          const jobId = payloadData.jobId;
+          const scheduleQuery = `
+            query SearchScheduleCards($request: SearchScheduleRequest!) {
+              searchScheduleCards(request: $request) {
+                scheduleId
+                hireStartDate
+                basePay
+                hoursPerWeek
+                workingDays
+                startTime
+                finishTime
+                location
+                postcode
+              }
+            }
+          `;
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: amazonHeaders,
+            body: JSON.stringify({
+              query: scheduleQuery,
+              variables: { request: { jobId, country: "GB", locale: "en_GB" } }
+            }),
+            dispatcher
+          });
+          if (res.status === 200) {
+            deleteFailedStmt.run(task.id);
+            console.log(`✅ [Loop 3] Retry successful for job ${jobId}`);
+          } else {
+            updateFailedStmt.run(now, task.id);
+          }
+        }
+      } catch (retryErr) {
+        console.error(`❌ [Loop 3 retry error for task ${task.id}]:`, retryErr.message);
+        updateFailedStmt.run(now, task.id);
+      }
+
+      await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+  } catch (error) {
+    console.error('❌ [Loop 3 fatal error]:', error.message);
+  }
+}
+
+// ----------------------------------------------------
+// Three-Loop Staggered Startup & Execution Coordinator
+// ----------------------------------------------------
+console.log('🚀 Starting Nationwide UK Amazon Shift Tracker (Three-Loop Architecture)...');
+
+await sendTelegramAlert("🚀 *Nationwide UK Amazon Shift Tracker Online!*\nThree-Loop Architecture (Discovery + Schedule Processing + Error Recovery) initiated.");
+
+// Initial immediate run of Loop 1
+await runLoop1Discovery();
+
+// Start Loop 1 continuous cycle (every 60 seconds)
+setInterval(runLoop1Discovery, 60 * 1000);
+
+// Stagger Loop 2 start by 5 seconds
+setTimeout(() => {
+  console.log('⚡ Initializing Loop 2 (Schedule Processing)...');
+  runLoop2Schedules();
+  setInterval(runLoop2Schedules, 30 * 1000);
+}, 5000);
+
+// Stagger Loop 3 start by 10 seconds
+setTimeout(() => {
+  console.log('🛡️ Initializing Loop 3 (Error Recovery & Retries)...');
+  runLoop3Recovery();
+  setInterval(runLoop3Recovery, 90 * 1000);
+}, 10000);
