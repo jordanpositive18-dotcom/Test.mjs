@@ -63,10 +63,11 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
       amazonResponder = async () => response({
         data: { searchScheduleCards: [DEFAULT_SCHEDULE] },
       }),
-      jobSearchResponder = async () => response({
+      jobSearchResponder = async (_url, _options, scanner) => response({
         data: {
           searchJobCardsByLocation: {
-            jobCards: [],
+            jobCards: scanner.db.prepare('SELECT job_id FROM job_queue').all()
+              .map(({ job_id }) => ({ jobId: job_id })),
             nextToken: null,
           },
         },
@@ -76,11 +77,9 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
       notificationBaseBackoffMs = 5000,
       notificationMaxBackoffMs = 60 * 60 * 1000,
       amazonPageSize = 20,
-      amazonRequestIntervalMs = 0,
+      amazonMaxConcurrentRequests = 3,
       amazonMaxRequestAttempts = 3,
       amazonForbiddenCooldownMs = 15 * 60 * 1000,
-      setIntervalImpl = setInterval,
-      setTimeoutImpl = setTimeout,
     } = {}) {
       const amazonCalls = [];
       const telegramCalls = [];
@@ -90,11 +89,9 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
         sleep: async () => {},
         logger: QUIET_LOGGER,
         amazonPageSize,
-        amazonRequestIntervalMs,
+        amazonMaxConcurrentRequests,
         amazonMaxRequestAttempts,
         amazonForbiddenCooldownMs,
-        setIntervalImpl,
-        setTimeoutImpl,
         telegramTimeoutMs,
         notificationBaseBackoffMs,
         notificationMaxBackoffMs,
@@ -102,7 +99,7 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
           const request = JSON.parse(options.body);
           amazonCalls.push({ url, options, operationName: request.operationName });
           return request.operationName === 'searchJobCardsByLocation'
-            ? jobSearchResponder(url, options)
+            ? jobSearchResponder(url, options, scanner)
             : amazonResponder(url, options);
         },
         telegramTransport: async (message, options) => {
@@ -128,6 +125,7 @@ async function processJob(fixture, jobId, discoveredAt = 'test') {
     "INSERT INTO job_queue (job_id, region, status, discovered_at) VALUES (?, 'London', 'PENDING', ?)",
   ).run(jobId, discoveredAt);
   await fixture.scanner.runLoop2Schedules();
+  await fixture.scanner.waitForNotificationDelivery();
 }
 
 function getNotification(scanner, scheduleId = DEFAULT_SCHEDULE.scheduleId) {

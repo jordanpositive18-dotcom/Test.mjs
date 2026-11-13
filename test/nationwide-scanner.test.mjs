@@ -76,25 +76,25 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
       scheduleResponder = async () => schedulePage([DEFAULT_SCHEDULE]),
       telegramResponder = async () => response({ ok: true, result: { message_id: 1 } }),
       amazonPageSize = 20,
-      amazonRequestIntervalMs = 0,
+      amazonMaxConcurrentRequests = 3,
       amazonMaxRequestAttempts = 3,
       amazonForbiddenCooldownMs = 15 * 60 * 1000,
-      setIntervalImpl = setInterval,
-      setTimeoutImpl = setTimeout,
+      maxCyclesPerLoop = Infinity,
+      logger = QUIET_LOGGER,
+      sleep = async () => {},
     } = {}) {
       const amazonCalls = [];
       const telegramCalls = [];
       const scanner = createScanner({
         databasePath,
         clock: () => currentTime,
-        sleep: async () => {},
-        logger: QUIET_LOGGER,
+        sleep,
+        logger,
         amazonPageSize,
-        amazonRequestIntervalMs,
+        amazonMaxConcurrentRequests,
         amazonMaxRequestAttempts,
         amazonForbiddenCooldownMs,
-        setIntervalImpl,
-        setTimeoutImpl,
+        maxCyclesPerLoop,
         fetchImpl: async (url, options) => {
           const request = JSON.parse(options.body);
           const call = { url, request, options };
@@ -178,6 +178,7 @@ test('all three loops can discover the same job without duplicate jobs or alerts
   await fixture.scanner.runLoop1Discovery();
   await fixture.scanner.runLoop2Schedules();
   await fixture.scanner.runLoop3Recovery();
+  await fixture.scanner.waitForNotificationDelivery();
 
   assert.equal(getCount(fixture.scanner, 'amazon_jobs'), 1);
   assert.equal(getCount(fixture.scanner, 'job_queue'), 1);
@@ -188,6 +189,12 @@ test('all three loops can discover the same job without duplicate jobs or alerts
   assert.equal(getCount(fixture.scanner, 'amazon_schedules'), 1);
   assert.equal(getCount(fixture.scanner, 'seen_schedules'), 1);
   assert.equal(getCount(fixture.scanner, 'telegram_notifications'), 1);
+  assert.equal(
+    fixture.amazonCalls.filter(
+      ({ request }) => request.operationName === 'searchScheduleCards',
+    ).length,
+    3,
+  );
   assert.equal(fixture.telegramCalls.length, 1);
 });
 
@@ -204,13 +211,16 @@ test('a later loop can discover a job that earlier loops did not return', async 
   await fixture.scanner.runLoop1Discovery();
   await fixture.scanner.runLoop2Schedules();
   await fixture.scanner.runLoop3Recovery();
+  await fixture.scanner.waitForNotificationDelivery();
 
   assert.equal(searchCount, 3);
   assert.equal(getCount(fixture.scanner, 'amazon_jobs'), 1);
   assert.equal(
     fixture.scanner.db.prepare("SELECT status FROM job_queue WHERE job_id = 'JOB-UK-1'").get().status,
-    'PENDING',
+    'PROCESSED',
   );
+  assert.equal(getCount(fixture.scanner, 'amazon_schedules'), 1);
+  assert.equal(getCount(fixture.scanner, 'telegram_notifications'), 1);
 });
 
 test('nationwide job search follows nextToken pages and records each page', async (t) => {
@@ -229,7 +239,9 @@ test('nationwide job search follows nextToken pages and records each page', asyn
   const result = await fixture.scanner.runLoop1Discovery();
 
   assert.deepEqual(
-    fixture.amazonCalls.map(({ request }) => request.variables.searchJobRequest.nextToken ?? null),
+    fixture.amazonCalls
+      .filter(({ request }) => request.operationName === 'searchJobCardsByLocation')
+      .map(({ request }) => request.variables.searchJobRequest.nextToken ?? null),
     [null, 'cursor-2'],
   );
   assert.equal(result.status, 'COMPLETE');
@@ -237,6 +249,74 @@ test('nationwide job search follows nextToken pages and records each page', asyn
   assert.equal(result.jobsFound, 2);
   assert.equal(getCount(fixture.scanner, 'amazon_jobs'), 2);
   assert.equal(getCount(fixture.scanner, 'job_queue'), 2);
+});
+
+test('scan metrics record requests, pages, duration, and completed-scan spacing', async (t) => {
+  const context = createContext(t);
+  const logs = [];
+  const fixture = context.createFixture({
+    logger: {
+      log: (...args) => logs.push(args.join(' ')),
+      warn() {},
+      error() {},
+    },
+    jobSearchResponder: async (request) => (
+      request.variables.searchJobRequest.nextToken
+        ? jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-METRICS-2' }])
+        : jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-METRICS-1' }], 'metrics-page-2')
+    ),
+  });
+
+  await fixture.scanner.runLoop1Discovery();
+  await fixture.scanner.waitForNotificationDelivery();
+  context.setTime(context.getTime() + 20);
+  await fixture.scanner.runLoop1Discovery();
+  await fixture.scanner.waitForNotificationDelivery();
+
+  const [latest, previous] = fixture.scanner.getScanRuns(2);
+  assert.equal(latest.request_count, 4);
+  assert.equal(latest.pages_fetched, 2);
+  assert.equal(latest.schedule_pages_fetched, 2);
+  assert.equal(latest.pagination_complete, 1);
+  assert.ok(latest.duration_ms >= 0);
+  assert.ok(latest.time_since_previous_ms >= 0);
+  assert.equal(previous.time_since_previous_ms, null);
+  const metricsLog = logs.find((line) => line.includes('[loop1] scan=COMPLETE'));
+  assert.match(metricsLog, /requests=4/);
+  assert.match(metricsLog, /pagination=complete/);
+});
+
+test('scan metric migration preserves pre-existing scan history', async (t) => {
+  const context = createContext(t);
+  const legacyDatabase = new Database(context.databasePath);
+  legacyDatabase.exec(`
+    CREATE TABLE scan_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      loop_name TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL,
+      pages_fetched INTEGER NOT NULL DEFAULT 0,
+      jobs_found INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      retry_at TEXT
+    );
+  `);
+  legacyDatabase.prepare(`
+    INSERT INTO scan_runs
+      (loop_name, started_at, finished_at, status, pages_fetched, jobs_found)
+    VALUES ('loop1', 'before-migration', 'before-migration', 'COMPLETE', 4, 12)
+  `).run();
+  legacyDatabase.close();
+
+  const fixture = context.createFixture();
+  const existing = fixture.scanner.getScanRuns(1)[0];
+  assert.equal(existing.started_at, 'before-migration');
+  assert.equal(existing.pages_fetched, 4);
+  assert.equal(existing.jobs_found, 12);
+  assert.equal(existing.request_count, 0);
+  assert.equal(existing.pagination_complete, 0);
+  assert.equal(existing.duration_ms, 0);
 });
 
 test('schedule pagination stores schedules and queues only one alert per scheduleId', async (t) => {
@@ -258,8 +338,19 @@ test('schedule pagination stores schedules and queues only one alert per schedul
     },
   });
 
+  await fixture.scanner.runLoop1Discovery();
   await fixture.scanner.runLoop2Schedules();
+  await fixture.scanner.runLoop3Recovery();
+  await fixture.scanner.waitForNotificationDelivery();
 
+  const scheduleRequests = fixture.amazonCalls.filter(
+    ({ request }) => request.operationName === 'searchScheduleCards',
+  );
+  assert.equal(scheduleRequests.length, 6);
+  assert.deepEqual(
+    scheduleRequests.map(({ request }) => request.variables.searchScheduleRequest.nextToken ?? null),
+    [null, 'schedule-cursor-2', null, 'schedule-cursor-2', null, 'schedule-cursor-2'],
+  );
   assert.equal(getCount(fixture.scanner, 'amazon_schedules'), 2);
   assert.equal(getCount(fixture.scanner, 'seen_schedules'), 2);
   assert.equal(getCount(fixture.scanner, 'telegram_notifications'), 2);
@@ -269,6 +360,29 @@ test('schedule pagination stores schedules and queues only one alert per schedul
       "SELECT status FROM job_queue WHERE job_id = 'JOB-UK-1'",
     ).get().status,
     'PROCESSED',
+  );
+});
+
+test('notification batches continue draining a backlog beyond ten alerts', async (t) => {
+  const context = createContext(t);
+  const schedules = Array.from({ length: 12 }, (_, index) => ({
+    ...DEFAULT_SCHEDULE,
+    scheduleId: `SCHEDULE-BATCH-${index + 1}`,
+  }));
+  const fixture = context.createFixture({
+    jobSearchResponder: async () => jobPage([DEFAULT_JOB]),
+    scheduleResponder: async () => schedulePage(schedules),
+  });
+
+  await fixture.scanner.runLoop1Discovery();
+  await fixture.scanner.waitForNotificationDelivery();
+
+  assert.equal(fixture.telegramCalls.length, 12);
+  assert.equal(
+    fixture.scanner.db.prepare(
+      "SELECT COUNT(*) AS count FROM telegram_notifications WHERE status = 'SENT'",
+    ).get().count,
+    12,
   );
 });
 
@@ -367,6 +481,7 @@ test('a partial paginated scan is recorded and completed on a later run', async 
   });
 
   const partial = await firstProcess.scanner.runLoop1Discovery();
+  await firstProcess.scanner.waitForNotificationDelivery();
   assert.equal(partial.status, 'PARTIAL');
   assert.equal(partial.pagesFetched, 1);
   assert.equal(getCount(firstProcess.scanner, 'amazon_jobs'), 1);
@@ -396,14 +511,13 @@ test('a partial paginated scan is recorded and completed on a later run', async 
 test('failed schedule work is re-queued and completed after a process restart', async (t) => {
   const context = createContext(t);
   const firstProcess = context.createFixture({
+    jobSearchResponder: async () => jobPage([
+      { ...DEFAULT_JOB, jobId: 'JOB-RECOVER' },
+    ]),
     scheduleResponder: async () => {
       throw new Error('mock schedule service failure');
     },
   });
-  firstProcess.scanner.db.prepare(`
-    INSERT INTO job_queue (job_id, region, status, discovered_at)
-    VALUES ('JOB-RECOVER', 'GB', 'PENDING', ?)
-  `).run(new Date(context.getTime()).toISOString());
 
   await firstProcess.scanner.runLoop2Schedules();
   assert.equal(
@@ -416,22 +530,20 @@ test('failed schedule work is re-queued and completed after a process restart', 
   firstProcess.close();
 
   context.setTime(context.getTime() + 90000);
-  const restarted = context.createFixture();
+  const restarted = context.createFixture({
+    jobSearchResponder: async () => jobPage([
+      { ...DEFAULT_JOB, jobId: 'JOB-RECOVER' },
+    ]),
+  });
   await restarted.scanner.runLoop3Recovery();
-  assert.equal(
-    restarted.scanner.db.prepare(
-      "SELECT status FROM job_queue WHERE job_id = 'JOB-RECOVER'",
-    ).get().status,
-    'PENDING',
-  );
-
-  await restarted.scanner.runLoop2Schedules();
   assert.equal(
     restarted.scanner.db.prepare(
       "SELECT status FROM job_queue WHERE job_id = 'JOB-RECOVER'",
     ).get().status,
     'PROCESSED',
   );
+
+  await restarted.scanner.waitForNotificationDelivery();
   assert.equal(getCount(restarted.scanner, 'amazon_schedules'), 1);
   assert.equal(getCount(restarted.scanner, 'telegram_notifications'), 1);
   assert.equal(getCount(restarted.scanner, 'failed_requests'), 0);
@@ -479,32 +591,67 @@ test('each loop skips overlaps but runs again after its active pass finishes', a
   }
 });
 
-test('start launches Loop 1 immediately and staggers Loop 2 and Loop 3', async (t) => {
+test('start launches three simultaneous loops and runs only the requested cycles', async (t) => {
   const context = createContext(t);
-  const timeouts = [];
-  const intervals = [];
+  let activeRequests = 0;
+  let maximumActiveRequests = 0;
+  let startedRequests = 0;
+  let releaseRequests;
+  let notifyAllStarted;
+  const requestGate = new Promise((resolve) => {
+    releaseRequests = resolve;
+  });
+  const allStarted = new Promise((resolve) => {
+    notifyAllStarted = resolve;
+  });
   const fixture = context.createFixture({
-    setTimeoutImpl: (callback, delay) => {
-      timeouts.push({ callback, delay });
-      return timeouts.length;
-    },
-    setIntervalImpl: (callback, delay) => {
-      intervals.push({ callback, delay });
-      return intervals.length;
+    maxCyclesPerLoop: 1,
+    jobSearchResponder: async () => {
+      activeRequests += 1;
+      maximumActiveRequests = Math.max(maximumActiveRequests, activeRequests);
+      startedRequests += 1;
+      if (startedRequests === 3) notifyAllStarted();
+      await requestGate;
+      activeRequests -= 1;
+      return jobPage();
     },
   });
 
-  await fixture.scanner.start();
-  assert.deepEqual(intervals.map(({ delay }) => delay), [60000]);
-  assert.deepEqual(timeouts.map(({ delay }) => delay), [5000, 10000]);
-  assert.equal(
-    fixture.scanner.db.prepare(
-      "SELECT last_status FROM loop_health WHERE loop_name = 'loop1'",
-    ).get().last_status,
-    'COMPLETE',
-  );
+  assert.deepEqual(fixture.scanner.start(), { status: 'STARTED', loops: 3 });
+  assert.equal(fixture.scanner.getRequestConcurrency(), 3);
+  await allStarted;
+  assert.equal(maximumActiveRequests, 3);
+  releaseRequests();
+  await fixture.scanner.waitForLoops();
 
-  await timeouts[0].callback();
-  await timeouts[1].callback();
-  assert.deepEqual(intervals.map(({ delay }) => delay), [60000, 30000, 90000]);
+  assert.deepEqual(
+    new Set(fixture.scanner.getScanRuns().map((run) => run.loop_name)),
+    new Set(['loop1', 'loop2', 'loop3']),
+  );
+  assert.equal(
+    fixture.scanner.getScanRuns().every((run) => run.status === 'COMPLETE'),
+    true,
+  );
+  await fixture.scanner.waitForNotificationDelivery();
+});
+
+test('successful scans restart immediately without fixed-cycle sleeps', async (t) => {
+  const context = createContext(t);
+  const sleeps = [];
+  const fixture = context.createFixture({
+    maxCyclesPerLoop: 2,
+    sleep: async (delay) => sleeps.push(delay),
+  });
+
+  fixture.scanner.start();
+  await fixture.scanner.waitForLoops();
+
+  assert.equal(fixture.amazonCalls.filter(
+    ({ request }) => request.operationName === 'searchJobCardsByLocation',
+  ).length, 6);
+  assert.deepEqual(sleeps, []);
+  assert.equal(
+    fixture.scanner.getScanRuns().every((run) => run.status === 'COMPLETE'),
+    true,
+  );
 });

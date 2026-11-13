@@ -21,26 +21,35 @@ const {
   notificationBaseBackoffMs = 5000,
   notificationMaxBackoffMs = 60 * 60 * 1000,
   amazonPageSize = 20,
-  amazonRequestIntervalMs = 2000,
+  amazonMaxConcurrentRequests = 3,
   amazonRequestTimeoutMs = 15000,
   amazonMaxRequestAttempts = 3,
   amazonRetryBaseMs = 1000,
   amazonForbiddenCooldownMs = 15 * 60 * 1000,
+  loopFailureRetryBaseMs = 1000,
+  loopFailureRetryMaxMs = 60 * 1000,
+  maxCyclesPerLoop = Infinity,
   clock = () => Date.now(),
+  monotonicClock = () => performance.now(),
   sleep = (milliseconds) => new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds)),
-  setIntervalImpl = setInterval,
-  setTimeoutImpl = setTimeout,
   logger = console,
 } = options;
+if (!Number.isInteger(amazonMaxConcurrentRequests) || amazonMaxConcurrentRequests < 1) {
+  throw new RangeError('amazonMaxConcurrentRequests must be a positive integer');
+}
+if (maxCyclesPerLoop !== Infinity
+  && (!Number.isInteger(maxCyclesPerLoop) || maxCyclesPerLoop < 1)) {
+  throw new RangeError('maxCyclesPerLoop must be a positive integer or Infinity');
+}
 const url = options.url ?? AMAZON_GRAPHQL_URL;
 const TG_TOKEN = telegramToken;
 const TG_CHAT_ID = telegramChatId;
 const db = suppliedDatabase ?? new Database(databasePath);
 const wait = (milliseconds) => sleep(milliseconds);
 const nowIso = () => new Date(clock()).toISOString();
-let lastAmazonRequestAt = null;
 let amazonCooldownUntil = 0;
-let amazonRequestQueue = Promise.resolve();
+let activeAmazonRequests = 0;
+const amazonRequestWaiters = [];
 
 class AmazonCooldownError extends Error {
   constructor(until) {
@@ -76,41 +85,55 @@ function applyAmazonCooldown(response) {
   );
 }
 
-function fetchAmazonOnce(requestUrl, requestOptions) {
-  const request = amazonRequestQueue.then(async () => {
+function withAmazonRequestSlot(operation) {
+  return new Promise((resolveRequest, rejectRequest) => {
+    const run = () => {
+      activeAmazonRequests += 1;
+      Promise.resolve()
+        .then(operation)
+        .then(resolveRequest, rejectRequest)
+        .finally(() => {
+          activeAmazonRequests -= 1;
+          const next = amazonRequestWaiters.shift();
+          if (next) next();
+        });
+    };
+
+    if (activeAmazonRequests < amazonMaxConcurrentRequests) run();
+    else amazonRequestWaiters.push(run);
+  });
+}
+
+function fetchAmazonOnce(requestUrl, requestOptions, metrics) {
+  return withAmazonRequestSlot(async () => {
     if (clock() < amazonCooldownUntil) {
       throw new AmazonCooldownError(amazonCooldownUntil);
     }
 
-    if (lastAmazonRequestAt !== null) {
-      const pacingDelay = Math.max(
-        0,
-        lastAmazonRequestAt + amazonRequestIntervalMs - clock(),
-      );
-      if (pacingDelay > 0) await wait(pacingDelay);
-    }
-
-    if (clock() < amazonCooldownUntil) {
-      throw new AmazonCooldownError(amazonCooldownUntil);
-    }
-
-    lastAmazonRequestAt = clock();
+    if (metrics) metrics.requestCount += 1;
     const signal = requestOptions.signal ?? AbortSignal.timeout(amazonRequestTimeoutMs);
-    return fetchImpl(requestUrl, {
+    const response = await fetchImpl(requestUrl, {
       ...requestOptions,
       ...(dispatcher ? { dispatcher } : {}),
       signal,
     });
+    if (response.status === 403 || response.status === 429) {
+      applyAmazonCooldown(response);
+      try {
+        await response.body?.cancel?.();
+      } catch {
+        // The cooldown is already recorded; cancellation is only connection cleanup.
+      }
+    }
+    return response;
   });
-  amazonRequestQueue = request.then(() => undefined, () => undefined);
-  return request;
 }
 
-async function fetchAmazon(requestUrl, requestOptions) {
+async function fetchAmazon(requestUrl, requestOptions, metrics) {
   for (let attempt = 1; attempt <= amazonMaxRequestAttempts; attempt += 1) {
     let response;
     try {
-      response = await fetchAmazonOnce(requestUrl, requestOptions);
+      response = await fetchAmazonOnce(requestUrl, requestOptions, metrics);
     } catch (error) {
       if (error?.code === 'AMAZON_COOLDOWN' || attempt === amazonMaxRequestAttempts) {
         throw error;
@@ -119,10 +142,7 @@ async function fetchAmazon(requestUrl, requestOptions) {
       continue;
     }
 
-    if (response.status === 403 || response.status === 429) {
-      applyAmazonCooldown(response);
-      return response;
-    }
+    if (response.status === 403 || response.status === 429) return response;
     if (response.status >= 500 && attempt < amazonMaxRequestAttempts) {
       try {
         await response.body?.cancel?.();
@@ -204,7 +224,12 @@ db.exec(`
     finished_at TEXT,
     status TEXT NOT NULL,
     pages_fetched INTEGER NOT NULL DEFAULT 0,
+    schedule_pages_fetched INTEGER NOT NULL DEFAULT 0,
     jobs_found INTEGER NOT NULL DEFAULT 0,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    pagination_complete INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    time_since_previous_ms INTEGER,
     error TEXT,
     retry_at TEXT
   );
@@ -228,6 +253,25 @@ db.exec(`
     value TEXT NOT NULL
   );
 `);
+
+const scanRunColumns = new Set(
+  db.prepare('PRAGMA table_info(scan_runs)').all().map((column) => column.name),
+);
+for (const [column, definition] of [
+  ['schedule_pages_fetched', 'INTEGER NOT NULL DEFAULT 0'],
+  ['request_count', 'INTEGER NOT NULL DEFAULT 0'],
+  ['pagination_complete', 'INTEGER NOT NULL DEFAULT 0'],
+  ['duration_ms', 'INTEGER NOT NULL DEFAULT 0'],
+  ['time_since_previous_ms', 'INTEGER'],
+]) {
+  if (!scanRunColumns.has(column)) {
+    try {
+      db.exec(`ALTER TABLE scan_runs ADD COLUMN ${column} ${definition}`);
+    } catch (error) {
+      if (!/duplicate column name/i.test(error.message)) throw error;
+    }
+  }
+}
 
 const persistedCooldown = db.prepare(
   "SELECT value FROM amazon_control WHERE key = 'cooldown_until'",
@@ -261,10 +305,13 @@ const upsertJobStmt = db.prepare(`
     status = CASE WHEN job_queue.status IN ('PROCESSED', 'FAILED') THEN job_queue.status ELSE 'PENDING' END
 `);
 
-const getPendingJobsStmt = db.prepare("SELECT job_id, region FROM job_queue WHERE status = 'PENDING' LIMIT 10");
 const markJobProcessedStmt = db.prepare("UPDATE job_queue SET status = 'PROCESSED' WHERE job_id = ?");
-const markJobFailedStmt = db.prepare("UPDATE job_queue SET status = 'FAILED' WHERE job_id = ?");
-const markJobPendingStmt = db.prepare("UPDATE job_queue SET status = 'PENDING' WHERE job_id = ?");
+const markJobFailedStmt = db.prepare(
+  "UPDATE job_queue SET status = 'FAILED' WHERE job_id = ? AND status != 'PROCESSED'",
+);
+const markJobPendingStmt = db.prepare(
+  "UPDATE job_queue SET status = 'PENDING' WHERE job_id = ? AND status != 'PROCESSED'",
+);
 let loop2Running = false;
 let loop1Running = false;
 let loop3Running = false;
@@ -273,26 +320,13 @@ const insertFailedStmt = db.prepare('INSERT INTO failed_requests (task_type, pay
 const findFailedScheduleStmt = db.prepare(
   "SELECT * FROM failed_requests WHERE task_type = 'LOOP2_SCHEDULE' AND payload = ? ORDER BY id DESC LIMIT 1",
 );
-const getFailedStmt = db.prepare(
-  "SELECT * FROM failed_requests WHERE task_type = 'LOOP2_SCHEDULE' ORDER BY id",
-);
-const updateFailedStmt = db.prepare(
-  'UPDATE failed_requests SET retry_count = retry_count + 1, last_tried = ? WHERE id = ?',
-);
 const updateFailedErrorStmt = db.prepare(
   'UPDATE failed_requests SET retry_count = retry_count + 1, last_tried = ?, error = ? WHERE id = ?',
 );
-const deleteFailedStmt = db.prepare('DELETE FROM failed_requests WHERE id = ?');
 const deleteFailedScheduleStmt = db.prepare(
   "DELETE FROM failed_requests WHERE task_type = 'LOOP2_SCHEDULE' AND payload = ?",
 );
 const getJobQueueStatusStmt = db.prepare('SELECT status FROM job_queue WHERE job_id = ?');
-const requeueFailedJobStmt = db.prepare(`
-  INSERT INTO job_queue (job_id, region, status, discovered_at)
-  VALUES (?, 'GB', 'PENDING', ?)
-  ON CONFLICT(job_id) DO UPDATE SET
-    status = CASE WHEN job_queue.status = 'PROCESSED' THEN 'PROCESSED' ELSE 'PENDING' END
-`);
 const insertScheduleStmt = db.prepare(`
   INSERT INTO amazon_schedules (schedule_id, job_id, raw_json, discovered_at)
   VALUES (?, ?, ?, ?)
@@ -312,6 +346,14 @@ const findClaimableNotificationStmt = db.prepare(`
      OR (status = 'CLAIMED' AND claim_expires_at <= ?)
   ORDER BY next_attempt_at, id
   LIMIT 1
+`);
+const hasClaimableNotificationStmt = db.prepare(`
+  SELECT EXISTS (
+    SELECT 1
+    FROM telegram_notifications
+    WHERE (status = 'PENDING' AND next_attempt_at <= ?)
+       OR (status = 'CLAIMED' AND claim_expires_at <= ?)
+  ) AS has_claimable
 `);
 const claimNotificationStmt = db.prepare(`
   UPDATE telegram_notifications
@@ -392,8 +434,9 @@ const markLoopStartedStmt = db.prepare(`
 `);
 const finishScanRunStmt = db.prepare(`
   UPDATE scan_runs
-  SET finished_at = ?, status = ?, pages_fetched = ?, jobs_found = ?,
-      error = ?, retry_at = ?
+  SET finished_at = ?, status = ?, pages_fetched = ?, schedule_pages_fetched = ?,
+      jobs_found = ?, request_count = ?, pagination_complete = ?, duration_ms = ?,
+      time_since_previous_ms = ?, error = ?, retry_at = ?
   WHERE id = ?
 `);
 const updateLoopHealthStmt = db.prepare(`
@@ -405,6 +448,13 @@ const updateLoopHealthStmt = db.prepare(`
 `);
 const getLoopHealthStmt = db.prepare('SELECT * FROM loop_health ORDER BY loop_name');
 const getScanRunsStmt = db.prepare('SELECT * FROM scan_runs ORDER BY id DESC LIMIT ?');
+const getPreviousCompletedScanStmt = db.prepare(`
+  SELECT finished_at
+  FROM scan_runs
+  WHERE loop_name = ? AND status = 'COMPLETE' AND finished_at IS NOT NULL
+  ORDER BY id DESC
+  LIMIT 1
+`);
 const claimNotificationTransaction = db.transaction((now, claimExpiresAt, claimToken) => {
   const notification = findClaimableNotificationStmt.get(now, now);
   if (!notification) return null;
@@ -548,6 +598,29 @@ async function deliverPendingNotifications() {
   return { sentCount, failedCount };
 }
 
+let notificationDeliveryRunning = false;
+let notificationDeliveryPromise = Promise.resolve();
+
+function kickNotificationDelivery() {
+  if (notificationDeliveryRunning) return;
+  notificationDeliveryRunning = true;
+  notificationDeliveryPromise = deliverPendingNotifications()
+    .catch((error) => logger.error('⚠️ Notification delivery pass failed:', error.message))
+    .finally(() => {
+      notificationDeliveryRunning = false;
+      const now = nowIso();
+      if (hasClaimableNotificationStmt.get(now, now).has_claimable) {
+        kickNotificationDelivery();
+      }
+    });
+}
+
+async function waitForNotificationDelivery() {
+  while (notificationDeliveryRunning) {
+    await notificationDeliveryPromise;
+  }
+}
+
 // Common headers for Amazon GraphQL
 const amazonHeaders = {
   'Content-Type': 'application/json',
@@ -623,7 +696,15 @@ function startScanRun(loopName) {
   return result.lastInsertRowid;
 }
 
-function finishScanRun(runId, loopName, { pagesFetched, jobsFound, error }) {
+function finishScanRun(runId, loopName, {
+  jobPagesFetched,
+  schedulePagesFetched,
+  jobsFound,
+  requestCount,
+  paginationComplete,
+  durationMs,
+  error,
+}) {
   const finishedAt = nowIso();
   const errorMessage = error
     ? String(error?.message ?? error).slice(0, 2000)
@@ -631,23 +712,40 @@ function finishScanRun(runId, loopName, { pagesFetched, jobsFound, error }) {
   const blocked = error?.status === 403
     || error?.status === 429
     || error?.code === 'AMAZON_COOLDOWN';
-  const status = !error
+  const status = !error && paginationComplete
     ? 'COMPLETE'
-    : blocked && pagesFetched === 0
+    : blocked && jobPagesFetched === 0 && schedulePagesFetched === 0
       ? 'BLOCKED'
-      : pagesFetched > 0
+      : jobPagesFetched > 0 || schedulePagesFetched > 0
         ? 'PARTIAL'
         : 'FAILED';
-  const retryAt = amazonCooldownUntil > clock()
-    ? new Date(amazonCooldownUntil).toISOString()
+  const retryTimestamp = amazonCooldownUntil > clock()
+    ? amazonCooldownUntil
+    : Number.isFinite(error?.retryAt)
+      ? error.retryAt
+      : null;
+  const retryAt = retryTimestamp === null
+    ? null
+    : new Date(retryTimestamp).toISOString();
+  const previousCompletedScan = status === 'COMPLETE'
+    ? getPreviousCompletedScanStmt.get(loopName)
+    : null;
+  const previousCompletedAt = Date.parse(previousCompletedScan?.finished_at ?? '');
+  const timeSincePreviousMs = Number.isFinite(previousCompletedAt)
+    ? Math.max(0, Date.parse(finishedAt) - previousCompletedAt)
     : null;
 
   const finish = db.transaction(() => {
     finishScanRunStmt.run(
       finishedAt,
       status,
-      pagesFetched,
+      jobPagesFetched,
+      schedulePagesFetched,
       jobsFound,
+      requestCount,
+      paginationComplete ? 1 : 0,
+      durationMs,
+      timeSincePreviousMs,
       errorMessage,
       retryAt,
       runId,
@@ -657,20 +755,46 @@ function finishScanRun(runId, loopName, { pagesFetched, jobsFound, error }) {
       status,
       status,
       errorMessage,
-      pagesFetched,
+      jobPagesFetched + schedulePagesFetched,
       jobsFound,
       loopName,
     );
   });
   finish.immediate();
-  return { status, pagesFetched, jobsFound, error: errorMessage, retryAt };
+  const result = {
+    status,
+    pagesFetched: jobPagesFetched,
+    jobPagesFetched,
+    schedulePagesFetched,
+    jobsFound,
+    requestCount,
+    paginationComplete,
+    durationMs,
+    timeSincePreviousMs,
+    error: errorMessage,
+    retryAt,
+  };
+  logger.log(
+    `[${loopName}] scan=${status} duration=${durationMs}ms requests=${requestCount} `
+    + `pages=jobs:${jobPagesFetched},schedules:${schedulePagesFetched} `
+    + `pagination=${paginationComplete ? 'complete' : 'incomplete'} jobs=${jobsFound} `
+    + `sincePreviousComplete=${timeSincePreviousMs === null ? 'n/a' : `${timeSincePreviousMs}ms`}`,
+  );
+  return result;
 }
 
 async function runNationwideScan(loopName) {
+  const startedAt = monotonicClock();
   const runId = startScanRun(loopName);
-  let pagesFetched = 0;
-  const foundJobIds = new Set();
+  const metrics = {
+    requestCount: 0,
+    jobPagesFetched: 0,
+    schedulePagesFetched: 0,
+  };
+  const foundJobs = new Map();
   let error = null;
+  let jobPaginationComplete = false;
+  let schedulePaginationComplete = true;
   const seenTokens = new Set();
   let nextToken = null;
 
@@ -691,7 +815,7 @@ async function runNationwideScan(loopName) {
           query: JOB_SEARCH_QUERY,
           variables: { searchJobRequest },
         }),
-      });
+      }, metrics);
 
       if (response.status !== 200) {
         throw createAmazonHttpError(response, 'nationwide job search');
@@ -710,15 +834,18 @@ async function runNationwideScan(loopName) {
         throw new Error('Amazon job search response did not contain a jobCards list');
       }
 
-      pagesFetched += 1;
+      metrics.jobPagesFetched += 1;
       for (const job of jobCards) {
         if (!job?.jobId) continue;
         saveDiscoveredJob.immediate(job, nowIso());
-        foundJobIds.add(job.jobId);
+        foundJobs.set(job.jobId, job);
       }
 
       const pageToken = Array.isArray(result) ? null : result?.nextToken;
-      if (!pageToken) break;
+      if (!pageToken) {
+        jobPaginationComplete = true;
+        break;
+      }
       if (seenTokens.has(pageToken)) {
         throw new Error('Amazon job search returned a repeated pagination token');
       }
@@ -730,32 +857,48 @@ async function runNationwideScan(loopName) {
     logger.error(`❌ [${loopName}] Nationwide scan did not finish:`, scanError.message);
   }
 
+  for (const job of foundJobs.values()) {
+    try {
+      await retrieveSchedulesForJob(job, metrics);
+      markJobProcessedAndClearFailures(job.jobId);
+    } catch (scheduleError) {
+      schedulePaginationComplete = false;
+      if (scheduleError?.code === 'SCHEDULE_RETRY_DEFERRED') {
+        markJobPendingStmt.run(job.jobId);
+      } else if (
+        scheduleError?.code === 'AMAZON_COOLDOWN'
+        || scheduleError?.status === 403
+        || scheduleError?.status === 429
+      ) {
+        markJobPendingStmt.run(job.jobId);
+      } else {
+        recordScheduleFailure(job.jobId, scheduleError);
+      }
+      if (!error) error = scheduleError;
+      logger.warn(`⚠️ [${loopName}] Schedule retrieval for ${job.jobId} did not finish: ${scheduleError.message}`);
+      if (
+        scheduleError?.code === 'AMAZON_COOLDOWN'
+        || scheduleError?.status === 403
+        || scheduleError?.status === 429
+      ) break;
+    }
+  }
+
+  const durationMs = Math.max(0, Math.round(monotonicClock() - startedAt));
+  const paginationComplete = jobPaginationComplete && schedulePaginationComplete;
   return finishScanRun(runId, loopName, {
-    pagesFetched,
-    jobsFound: foundJobIds.size,
+    jobPagesFetched: metrics.jobPagesFetched,
+    schedulePagesFetched: metrics.schedulePagesFetched,
+    jobsFound: foundJobs.size,
+    requestCount: metrics.requestCount,
+    paginationComplete,
+    durationMs,
     error,
   });
 }
 
-// ----------------------------------------------------
-// LOOP 1: Nationwide Job Discovery & Pagination
-// ----------------------------------------------------
 async function runLoop1Discovery() {
-  if (loop1Running) {
-    logger.log('🌍 [Loop 1] Skipping this pass because the previous pass is still running.');
-    return { status: 'SKIPPED', pagesFetched: 0, jobsFound: 0 };
-  }
-
-  loop1Running = true;
-  try {
-    logger.log('🌍 [Loop 1] Starting an unfiltered nationwide UK job scan...');
-    return await runNationwideScan('loop1');
-  } catch (error) {
-    logger.error('❌ [Loop 1 fatal error]:', error.message);
-    return { status: 'FAILED', pagesFetched: 0, jobsFound: 0, error: error.message };
-  } finally {
-    loop1Running = false;
-  }
+  return runSingleLoopPass('loop1', () => loop1Running, (value) => { loop1Running = value; });
 }
 
 // ----------------------------------------------------
@@ -765,15 +908,68 @@ function recordScheduleFailure(jobId, failure) {
   const payload = JSON.stringify({ jobId });
   const errorMessage = String(failure?.message ?? failure).slice(0, 2000);
   const triedAt = nowIso();
-  const existing = findFailedScheduleStmt.get(payload);
-  if (existing) {
-    updateFailedErrorStmt.run(triedAt, errorMessage, existing.id);
-  } else {
-    insertFailedStmt.run('LOOP2_SCHEDULE', payload, errorMessage, 0, triedAt);
+  const saveFailure = db.transaction(() => {
+    if (getJobQueueStatusStmt.get(jobId)?.status === 'PROCESSED') return false;
+    markJobFailedStmt.run(jobId);
+    const existing = findFailedScheduleStmt.get(payload);
+    if (existing) {
+      updateFailedErrorStmt.run(triedAt, errorMessage, existing.id);
+    } else {
+      insertFailedStmt.run('LOOP2_SCHEDULE', payload, errorMessage, 0, triedAt);
+    }
+    return true;
+  });
+  return saveFailure.immediate();
+}
+
+function markJobProcessedAndClearFailures(jobId) {
+  const markComplete = db.transaction(() => {
+    markJobProcessedStmt.run(jobId);
+    deleteFailedScheduleStmt.run(JSON.stringify({ jobId }));
+  });
+  markComplete.immediate();
+}
+
+async function runSingleLoopPass(loopName, isRunning, setRunning) {
+  if (isRunning()) {
+    logger.log(`[${loopName}] Skipping this pass because its previous pass is still running.`);
+    return { status: 'SKIPPED', pagesFetched: 0, jobsFound: 0 };
+  }
+
+  setRunning(true);
+  try {
+    logger.log(`[${loopName}] Starting an unfiltered nationwide UK job and schedule scan.`);
+    const result = await runNationwideScan(loopName);
+    kickNotificationDelivery();
+    return result;
+  } catch (error) {
+    logger.error(`[${loopName}] Fatal scan error:`, error.message);
+    return { status: 'FAILED', pagesFetched: 0, jobsFound: 0, error: error.message };
+  } finally {
+    setRunning(false);
   }
 }
 
-async function retrieveSchedulesForJob(job) {
+function checkScheduleRetryWindow(jobId) {
+  const task = findFailedScheduleStmt.get(JSON.stringify({ jobId }));
+  if (!task) return;
+  const lastTriedAt = Date.parse(task.last_tried || '');
+  const retryDelay = Math.min(
+    1000 * (2 ** Math.min(task.retry_count, 10)),
+    loopFailureRetryMaxMs,
+  );
+  if (!Number.isFinite(lastTriedAt) || clock() - lastTriedAt >= retryDelay) return;
+
+  const retryAt = lastTriedAt + retryDelay;
+  const error = new Error(`Schedule retry for job ${jobId} is deferred until ${new Date(retryAt).toISOString()}`);
+  error.code = 'SCHEDULE_RETRY_DEFERRED';
+  error.retryAt = retryAt;
+  throw error;
+}
+
+async function retrieveSchedulesForJob(job, metrics) {
+  const jobId = job.jobId ?? job.job_id;
+  checkScheduleRetryWindow(jobId);
   let nextToken = null;
   const seenTokens = new Set();
 
@@ -781,7 +977,7 @@ async function retrieveSchedulesForJob(job) {
     const searchScheduleRequest = {
       country: 'GB',
       locale: 'en_GB',
-      jobId: job.job_id,
+      jobId,
       keyWords: '',
       pageSize: amazonPageSize,
       equalFilters: [],
@@ -801,10 +997,10 @@ async function retrieveSchedulesForJob(job) {
         query: SCHEDULE_SEARCH_QUERY,
         variables: { searchScheduleRequest },
       }),
-    });
+    }, metrics);
 
     if (response.status !== 200) {
-      throw createAmazonHttpError(response, `schedule search for job ${job.job_id}`);
+      throw createAmazonHttpError(response, `schedule search for job ${jobId}`);
     }
     const payload = await response.json();
     const graphQLError = getGraphQLErrorMessage(payload);
@@ -817,12 +1013,13 @@ async function retrieveSchedulesForJob(job) {
       ? result
       : result?.scheduleCards;
     if (!Array.isArray(scheduleCards)) {
-      throw new Error(`Amazon schedule response for job ${job.job_id} did not contain a scheduleCards list`);
+      throw new Error(`Amazon schedule response for job ${jobId} did not contain a scheduleCards list`);
     }
 
+    metrics.schedulePagesFetched += 1;
     for (const schedule of scheduleCards) {
       if (!schedule?.scheduleId) {
-        throw new Error(`Amazon returned a schedule without scheduleId for job ${job.job_id}`);
+        throw new Error(`Amazon returned a schedule without scheduleId for job ${jobId}`);
       }
 
       const shiftInfo = {
@@ -843,175 +1040,89 @@ async function retrieveSchedulesForJob(job) {
       };
       const enqueued = saveScheduleAndNotification.immediate(
         schedule,
-        job.job_id,
+        jobId,
         formatShiftAlert(shiftInfo),
         nowIso(),
       );
       if (enqueued) {
-        logger.log(`🚨 [Loop 2] New schedule discovered & queued for alert! ID: ${schedule.scheduleId}`);
+        logger.log(`🚨 [${jobId}] New schedule discovered & queued for alert! ID: ${schedule.scheduleId}`);
       }
     }
 
     const pageToken = Array.isArray(result) ? null : result?.nextToken;
     if (!pageToken) return;
     if (seenTokens.has(pageToken)) {
-      throw new Error(`Amazon returned a repeated schedule pagination token for job ${job.job_id}`);
+      throw new Error(`Amazon returned a repeated schedule pagination token for job ${jobId}`);
     }
     seenTokens.add(pageToken);
     nextToken = pageToken;
   }
 }
 
-async function processPendingScheduleJobs() {
-  if (clock() < amazonCooldownUntil) {
-    logger.warn('⚠️ [Loop 2] Schedule processing is paused by Amazon cooldown.');
-    return;
-  }
-
-  const pendingJobs = getPendingJobsStmt.all();
-  if (pendingJobs.length === 0) {
-    logger.log('⚡ [Loop 2] No pending jobs in queue.');
-  }
-
-  for (const job of pendingJobs) {
-    try {
-      await retrieveSchedulesForJob(job);
-      markJobProcessedStmt.run(job.job_id);
-      deleteFailedScheduleStmt.run(JSON.stringify({ jobId: job.job_id }));
-    } catch (error) {
-      if (
-        error?.code === 'AMAZON_COOLDOWN'
-        || error?.status === 403
-        || error?.status === 429
-      ) {
-        markJobPendingStmt.run(job.job_id);
-        logger.warn(`⚠️ [Loop 2] Pausing job ${job.job_id} until Amazon allows requests again.`);
-        break;
-      }
-
-      logger.error(`❌ [Loop 2 error for job ${job.job_id}]:`, error.message);
-      markJobFailedStmt.run(job.job_id);
-      recordScheduleFailure(job.job_id, error);
-    }
-  }
-}
-
 async function runLoop2Schedules() {
-  if (loop2Running) {
-    logger.log('⚡ [Loop 2] Skipping this pass because the previous pass is still running.');
-    return { status: 'SKIPPED' };
-  }
-
-  loop2Running = true;
-  try {
-    logger.log('⚡ [Loop 2] Starting its own nationwide UK job scan...');
-    const scanResult = await runNationwideScan('loop2');
-    await processPendingScheduleJobs();
-    await deliverPendingNotifications();
-    return scanResult;
-  } catch (error) {
-    logger.error('❌ [Loop 2 fatal error]:', error.message);
-    return { status: 'FAILED', error: error.message };
-  } finally {
-    loop2Running = false;
-  }
-}
-
-// ----------------------------------------------------
-// LOOP 3: Error Recovery, Failed Requests & Safe Retries
-// ----------------------------------------------------
-async function retryFailedScheduleJobs() {
-  const failedTasks = getFailedStmt.all();
-  const visitedJobs = new Set();
-
-  for (const task of failedTasks) {
-    let payload;
-    try {
-      payload = JSON.parse(task.payload || '{}');
-    } catch (error) {
-      logger.error(`❌ [Loop 3] Invalid retry payload for task ${task.id}:`, error.message);
-      continue;
-    }
-
-    const jobId = payload.jobId;
-    if (!jobId || visitedJobs.has(jobId)) continue;
-    visitedJobs.add(jobId);
-
-    const queueRow = getJobQueueStatusStmt.get(jobId);
-    if (queueRow?.status === 'PROCESSED') {
-      deleteFailedStmt.run(task.id);
-      continue;
-    }
-    if (queueRow?.status === 'PENDING') continue;
-
-    const lastTriedAt = Date.parse(task.last_tried || '');
-    const retryDelay = Math.min(
-      5000 * (2 ** Math.min(task.retry_count, 10)),
-      60 * 60 * 1000,
-    );
-    if (Number.isFinite(lastTriedAt) && clock() - lastTriedAt < retryDelay) continue;
-
-    const retriedAt = nowIso();
-    requeueFailedJobStmt.run(jobId, retriedAt);
-    updateFailedStmt.run(retriedAt, task.id);
-    logger.log(`🛡️ [Loop 3] Re-queued failed schedule work for job ${jobId}.`);
-  }
+  return runSingleLoopPass('loop2', () => loop2Running, (value) => { loop2Running = value; });
 }
 
 async function runLoop3Recovery() {
-  if (loop3Running) {
-    logger.log('🛡️ [Loop 3] Skipping this pass because the previous pass is still running.');
-    return { status: 'SKIPPED' };
-  }
+  return runSingleLoopPass('loop3', () => loop3Running, (value) => { loop3Running = value; });
+}
 
-  loop3Running = true;
-  try {
-    logger.log('🛡️ [Loop 3] Starting its own nationwide UK job scan and recovery pass...');
-    const scanResult = await runNationwideScan('loop3');
-    try {
-      await retryFailedScheduleJobs();
-    } catch (error) {
-      logger.error('❌ [Loop 3 recovery error]:', error.message);
+let stopRequested = false;
+let loopsStarted = false;
+let continuousLoopPromises = [];
+const loopFailureCounts = new Map();
+
+async function runContinuousLoop(loopName, runPass) {
+  let cycles = 0;
+  while (!stopRequested && cycles < maxCyclesPerLoop) {
+    const result = await runPass();
+    cycles += 1;
+    if (stopRequested || cycles >= maxCyclesPerLoop) break;
+
+    if (result.status === 'COMPLETE') {
+      loopFailureCounts.set(loopName, 0);
+      continue;
     }
-    try {
-      await deliverPendingNotifications();
-    } catch (error) {
-      logger.error('❌ [Loop 3 notification recovery error]:', error.message);
+
+    if (clock() < amazonCooldownUntil) {
+      await wait(Math.max(0, amazonCooldownUntil - clock()));
+      continue;
     }
-    return scanResult;
-  } catch (error) {
-    logger.error('❌ [Loop 3 fatal error]:', error.message);
-    return { status: 'FAILED', error: error.message };
-  } finally {
-    loop3Running = false;
+
+    const failureCount = (loopFailureCounts.get(loopName) ?? 0) + 1;
+    loopFailureCounts.set(loopName, failureCount);
+    const retryDelay = Math.min(
+      loopFailureRetryBaseMs * (2 ** Math.min(failureCount - 1, 10)),
+      loopFailureRetryMaxMs,
+    );
+    await wait(retryDelay);
   }
 }
 
-async function start() {
-  logger.log('🚀 Starting Nationwide UK Amazon Shift Tracker (Three-Loop Architecture)...');
-  const initialLoop1Run = runLoop1Discovery();
+function start() {
+  if (loopsStarted) return { status: 'ALREADY_RUNNING', loops: 3 };
+  logger.log(
+    `🚀 Starting exactly three simultaneous nationwide UK scan loops; `
+    + `maximum Amazon request concurrency=${amazonMaxConcurrentRequests}.`,
+  );
+  stopRequested = false;
+  loopsStarted = true;
+  continuousLoopPromises = [
+    ['loop1', runLoop1Discovery],
+    ['loop2', runLoop2Schedules],
+    ['loop3', runLoop3Recovery],
+  ].map(([loopName, runPass]) => runContinuousLoop(loopName, runPass));
 
-  // Start Loop 1 continuous cycle (every 60 seconds)
-  setIntervalImpl(runLoop1Discovery, 60 * 1000);
+  void sendTelegramAlert(
+    '🚀 *Nationwide UK Amazon Shift Tracker Online!*\nThree simultaneous scan loops initiated.',
+  ).catch((error) => logger.error('⚠️ Startup Telegram alert failed:', error.message));
+  return { status: 'STARTED', loops: 3 };
+}
 
-  // Stagger Loop 2 start by 5 seconds
-  setTimeoutImpl(() => {
-    logger.log('⚡ Initializing Loop 2 (Schedule Processing)...');
-    const initialLoop2Run = runLoop2Schedules();
-    setIntervalImpl(runLoop2Schedules, 30 * 1000);
-    return initialLoop2Run;
-  }, 5000);
-
-  // Stagger Loop 3 start by 10 seconds
-  setTimeoutImpl(() => {
-    logger.log('🛡️ Initializing Loop 3 (Error Recovery & Retries)...');
-    const initialLoop3Run = runLoop3Recovery();
-    setIntervalImpl(runLoop3Recovery, 90 * 1000);
-    return initialLoop3Run;
-  }, 10000);
-
-  await sendTelegramAlert("🚀 *Nationwide UK Amazon Shift Tracker Online!*\nThree-Loop Architecture (Discovery + Schedule Processing + Error Recovery) initiated.");
-  return initialLoop1Run;
+async function stop() {
+  stopRequested = true;
+  await Promise.all(continuousLoopPromises);
+  loopsStarted = false;
 }
 
 return {
@@ -1022,8 +1133,12 @@ return {
   runNotificationDelivery: deliverPendingNotifications,
   getLoopHealth: () => getLoopHealthStmt.all(),
   getScanRuns: (limit = 50) => getScanRunsStmt.all(limit),
+  getRequestConcurrency: () => amazonMaxConcurrentRequests,
   sendTelegramAlert,
   start,
+  stop,
+  waitForLoops: () => Promise.all(continuousLoopPromises),
+  waitForNotificationDelivery,
   close: () => db.close(),
 };
 }
