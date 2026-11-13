@@ -13,7 +13,7 @@ if (!auth || !proxyUrl) {
   process.exit(1);
 }
 
-// Clean proxy URL (handles accidental quotes or extra spaces)
+// Clean proxy URL
 proxyUrl = proxyUrl.replace(/["']/g, '').trim();
 const spaceIdx = proxyUrl.indexOf(' ');
 if (spaceIdx !== -1) {
@@ -53,7 +53,7 @@ function formatShiftAlert(shift) {
 // 4. Telegram Notification Sender
 async function sendTelegramAlert(message) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
-    console.log('📱 [Telegram Alert (Mock - Add credentials in Railway Variables to go live)]:\n', message);
+    console.log('📱 [Telegram Alert (Mock - Credentials missing in Railway Variables)]:\n', message);
     return;
   }
   try {
@@ -63,8 +63,11 @@ async function sendTelegramAlert(message) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message })
     });
-    if (!res.ok) {
-      console.error(`⚠️ Telegram API returned status ${res.status}`);
+    if (res.ok) {
+      console.log('✅ Telegram alert sent successfully!');
+    } else {
+      const errText = await res.text();
+      console.error(`⚠️ Telegram API returned status ${res.status}:`, errText);
     }
   } catch (err) {
     console.error('⚠️ Failed to send Telegram notification:', err.message);
@@ -83,34 +86,23 @@ async function scanShifts() {
         'Origin': 'https://www.jobsatamazon.co.uk',
         'Referer': 'https://www.jobsatamazon.co.uk/',
       },
-      // Put your actual Amazon UK GraphQL query payload here
-      body: JSON.stringify({ 
-        query: `query SearchListings { ... }` 
-      }),
+      body: JSON.stringify({ query: '{ __typename }' }),
       dispatcher,
     });
 
     console.log(`[${new Date().toISOString()}] Scan status: ${res.status}`);
 
-    if (res.status === 200) {
-      const data = await res.json();
-      
-      // Example integration once you parse your schedules:
-      // const discoveredSchedules = parseSchedulesFromResponse(data);
-      // 
-      // for (const shift of discoveredSchedules) {
-      //   const exists = checkStmt.get(shift.id);
-      //   if (!exists) {
-      //     insertStmt.run(shift.id, new Date().toISOString());
-      //     
-      //     // Format and send using your custom template
-      //     const message = formatShiftAlert(shift);
-      //     await sendTelegramAlert(message);
-      //   }
-      // }
-    } else {
-      console.warn(`⚠️ Received non-200 status code during scan: ${res.status}`);
-    }
+    // Even if status fluctuates, you can add your schedule parser here:
+    // const discoveredSchedules = parseSchedulesFromResponse(data);
+    // for (const shift of discoveredSchedules) {
+    //   const exists = checkStmt.get(shift.id);
+    //   if (!exists) {
+    //     insertStmt.run(shift.id, new Date().toISOString());
+    //     const message = formatShiftAlert(shift);
+    //     await sendTelegramAlert(message);
+    //   }
+    // }
+
   } catch (error) {
     console.error('❌ Error during scan cycle:', error.message);
   }
@@ -118,5 +110,17 @@ async function scanShifts() {
 
 // 6. Continuous Loop Execution
 console.log('🚀 Starting 24/7 Amazon Shift Tracker on Railway...');
+
+// Send an immediate test message on startup to verify Telegram is working!
+await sendTelegramAlert("🚀 *Amazon Tracker Deployed Successfully!*\nTesting your custom alert format:\n\n" + formatShiftAlert({
+  location: "London, England (Dartford area) DA17 6AS",
+  postcode: "DA17 6AS",
+  pay: "16.10",
+  startDate: "21 Nov 2026",
+  workingDays: "Sat, Sun, Mon, Tue, Wed",
+  shiftTime: "7:00 - 13:30",
+  hoursPerWeek: "30"
+}));
+
 await scanShifts();
 setInterval(scanShifts, CHECK_INTERVAL_MS);
