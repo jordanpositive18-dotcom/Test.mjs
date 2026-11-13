@@ -1,0 +1,1 @@
+- [Project change boundaries](project-boundaries.md) — Keep Amazon Shift Finder work separate from Auto Booker and production systems.

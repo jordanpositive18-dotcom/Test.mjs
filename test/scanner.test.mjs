@@ -24,10 +24,15 @@ const QUIET_LOGGER = {
   error() {},
 };
 
-function response(body, status = 200) {
+function response(body, status = 200, headers = {}) {
   return {
     status,
     ok: status >= 200 && status < 300,
+    headers: {
+      get(name) {
+        return headers[name.toLowerCase()] ?? null;
+      },
+    },
     async json() {
       return body;
     },
@@ -58,25 +63,47 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
       amazonResponder = async () => response({
         data: { searchScheduleCards: [DEFAULT_SCHEDULE] },
       }),
+      jobSearchResponder = async () => response({
+        data: {
+          searchJobCardsByLocation: {
+            jobCards: [],
+            nextToken: null,
+          },
+        },
+      }),
       telegramResponder = async () => response({ ok: true, result: { message_id: 1 } }),
       telegramTimeoutMs = 15000,
       notificationBaseBackoffMs = 5000,
       notificationMaxBackoffMs = 60 * 60 * 1000,
+      amazonPageSize = 20,
+      amazonRequestIntervalMs = 0,
+      amazonMaxRequestAttempts = 3,
+      amazonForbiddenCooldownMs = 15 * 60 * 1000,
+      setIntervalImpl = setInterval,
+      setTimeoutImpl = setTimeout,
     } = {}) {
       const amazonCalls = [];
       const telegramCalls = [];
       const scanner = createScanner({
         databasePath,
-        regions: ['London'],
         clock: () => currentTime,
         sleep: async () => {},
         logger: QUIET_LOGGER,
+        amazonPageSize,
+        amazonRequestIntervalMs,
+        amazonMaxRequestAttempts,
+        amazonForbiddenCooldownMs,
+        setIntervalImpl,
+        setTimeoutImpl,
         telegramTimeoutMs,
         notificationBaseBackoffMs,
         notificationMaxBackoffMs,
         fetchImpl: async (url, options) => {
-          amazonCalls.push({ url, options });
-          return amazonResponder(url, options);
+          const request = JSON.parse(options.body);
+          amazonCalls.push({ url, options, operationName: request.operationName });
+          return request.operationName === 'searchJobCardsByLocation'
+            ? jobSearchResponder(url, options)
+            : amazonResponder(url, options);
         },
         telegramTransport: async (message, options) => {
           telegramCalls.push({ message, options });
@@ -197,22 +224,32 @@ test('successful delivery preserves the exact alert format and records sent time
 test('Loop 2 skips overlapping passes and accepts the next pass afterward', async (t) => {
   const context = createContext(t);
   let releaseFirstRequest;
+  let signalFirstRequestStarted;
   const firstRequestGate = new Promise((resolveGate) => {
     releaseFirstRequest = resolveGate;
   });
+  const firstRequestStarted = new Promise((resolveStarted) => {
+    signalFirstRequestStarted = resolveStarted;
+  });
   let amazonCallCount = 0;
   const fixture = context.createFixture({
-    amazonResponder: async () => {
+    jobSearchResponder: async () => {
       amazonCallCount += 1;
+      signalFirstRequestStarted();
       if (amazonCallCount === 1) await firstRequestGate;
-      return response({ data: { searchScheduleCards: [] } });
+      return response({
+        data: {
+          searchJobCardsByLocation: {
+            jobCards: [],
+            nextToken: null,
+          },
+        },
+      });
     },
   });
-  fixture.scanner.db.prepare(
-    "INSERT INTO job_queue (job_id, region, status, discovered_at) VALUES ('JOB-OVERLAP', 'London', 'PENDING', 'test')",
-  ).run();
 
   const firstPass = fixture.scanner.runLoop2Schedules();
+  await firstRequestStarted;
   assert.equal(amazonCallCount, 1);
 
   await fixture.scanner.runLoop2Schedules();
@@ -220,30 +257,17 @@ test('Loop 2 skips overlapping passes and accepts the next pass afterward', asyn
 
   releaseFirstRequest();
   await firstPass;
-  assert.equal(
-    fixture.scanner.db.prepare(
-      "SELECT status FROM job_queue WHERE job_id = 'JOB-OVERLAP'",
-    ).get().status,
-    'PROCESSED',
-  );
-
-  await processJob(fixture, 'JOB-AFTER-OVERLAP');
+  await fixture.scanner.runLoop2Schedules();
   assert.equal(amazonCallCount, 2);
-  assert.equal(
-    fixture.scanner.db.prepare(
-      "SELECT status FROM job_queue WHERE job_id = 'JOB-AFTER-OVERLAP'",
-    ).get().status,
-    'PROCESSED',
-  );
 });
 
 test('Loop 2 releases its guard after a processing error', async (t) => {
   const context = createContext(t);
-  let amazonCallCount = 0;
+  let scheduleCallCount = 0;
   const fixture = context.createFixture({
     amazonResponder: async () => {
-      amazonCallCount += 1;
-      if (amazonCallCount === 1) throw new Error('mock schedule request failure');
+      scheduleCallCount += 1;
+      if (scheduleCallCount <= 3) throw new Error('mock schedule request failure');
       return response({ data: { searchScheduleCards: [] } });
     },
   });
@@ -257,7 +281,7 @@ test('Loop 2 releases its guard after a processing error', async (t) => {
   );
 
   await processJob(fixture, 'JOB-RECOVERS');
-  assert.equal(amazonCallCount, 2);
+  assert.equal(scheduleCallCount, 4);
   assert.equal(
     fixture.scanner.db.prepare(
       "SELECT status FROM job_queue WHERE job_id = 'JOB-RECOVERS'",
