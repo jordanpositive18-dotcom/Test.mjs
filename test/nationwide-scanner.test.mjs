@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import Database from 'better-sqlite3';
 import test from 'node:test';
-import { createScanner } from '../tracker.mjs';
+import { createScanner, UK_HUB_SEARCH_TERMS } from '../tracker.mjs';
 
 const BASE_TIME = Date.parse('2026-11-13T12:00:00.000Z');
 const DEFAULT_JOB = {
@@ -77,6 +77,8 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
       telegramResponder = async () => response({ ok: true, result: { message_id: 1 } }),
       amazonPageSize = 20,
       amazonMaxConcurrentRequests = 3,
+      amazonMinimumRequestIntervalMs = 0,
+      jobSearchTerms = ['London'],
       amazonMaxRequestAttempts = 3,
       amazonForbiddenCooldownMs = 15 * 60 * 1000,
       maxCyclesPerLoop = Infinity,
@@ -92,6 +94,8 @@ function createContext(t, { initialTime = BASE_TIME } = {}) {
         logger,
         amazonPageSize,
         amazonMaxConcurrentRequests,
+        amazonMinimumRequestIntervalMs,
+        jobSearchTerms,
         amazonMaxRequestAttempts,
         amazonForbiddenCooldownMs,
         maxCyclesPerLoop,
@@ -134,9 +138,9 @@ function getCount(scanner, table) {
   return scanner.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count;
 }
 
-test('all three loops use the same unfiltered UK search request', async (t) => {
+test('all three loops independently search the same complete hub list without blank queries', async (t) => {
   const context = createContext(t);
-  const fixture = context.createFixture({ amazonPageSize: 17 });
+  const fixture = context.createFixture({ jobSearchTerms: UK_HUB_SEARCH_TERMS });
 
   await fixture.scanner.runLoop1Discovery();
   await fixture.scanner.runLoop2Schedules();
@@ -145,19 +149,21 @@ test('all three loops use the same unfiltered UK search request', async (t) => {
   const searches = fixture.amazonCalls.filter(
     ({ request }) => request.operationName === 'searchJobCardsByLocation',
   );
-  assert.equal(searches.length, 3);
-  for (const { request } of searches) {
-    assert.deepEqual(request.variables.searchJobRequest, {
-      country: 'GB',
-      locale: 'en_GB',
-      keyWords: '',
-      pageSize: 17,
+  assert.equal(searches.length, UK_HUB_SEARCH_TERMS.length * 3);
+  assert.equal(new Set(UK_HUB_SEARCH_TERMS).size, UK_HUB_SEARCH_TERMS.length);
+  for (let index = 0; index < searches.length; index += 1) {
+    const { request } = searches[index];
+    assert.deepEqual(request.variables.request, {
+      country: 'United Kingdom',
+      locale: 'en-GB',
+      query: UK_HUB_SEARCH_TERMS[index % UK_HUB_SEARCH_TERMS.length],
     });
     assert.match(request.query, /nextToken/);
     assert.match(request.query, /jobCards/);
-    assert.equal('city' in request.variables.searchJobRequest, false);
-    assert.equal('postcode' in request.variables.searchJobRequest, false);
-    assert.equal('postalCode' in request.variables.searchJobRequest, false);
+    assert.match(request.query, /searchJobCardsByLocation\(request: \$request\)/);
+    assert.equal('city' in request.variables.request, false);
+    assert.equal('postcode' in request.variables.request, false);
+    assert.equal('postalCode' in request.variables.request, false);
   }
   assert.deepEqual(
     fixture.scanner.getScanRuns().map((run) => [run.loop_name, run.status]),
@@ -228,10 +234,10 @@ test('nationwide job search follows nextToken pages and records each page', asyn
   const fixture = context.createFixture({
     amazonPageSize: 2,
     jobSearchResponder: async (request) => {
-      if (!request.variables.searchJobRequest.nextToken) {
+      if (!request.variables.request.nextToken) {
         return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PAGE-1' }], 'cursor-2');
       }
-      assert.equal(request.variables.searchJobRequest.nextToken, 'cursor-2');
+      assert.equal(request.variables.request.nextToken, 'cursor-2');
       return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PAGE-2' }]);
     },
   });
@@ -241,7 +247,7 @@ test('nationwide job search follows nextToken pages and records each page', asyn
   assert.deepEqual(
     fixture.amazonCalls
       .filter(({ request }) => request.operationName === 'searchJobCardsByLocation')
-      .map(({ request }) => request.variables.searchJobRequest.nextToken ?? null),
+      .map(({ request }) => request.variables.request.nextToken ?? null),
     [null, 'cursor-2'],
   );
   assert.equal(result.status, 'COMPLETE');
@@ -261,7 +267,7 @@ test('scan metrics record requests, pages, duration, and completed-scan spacing'
       error() {},
     },
     jobSearchResponder: async (request) => (
-      request.variables.searchJobRequest.nextToken
+      request.variables.request.nextToken
         ? jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-METRICS-2' }])
         : jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-METRICS-1' }], 'metrics-page-2')
     ),
@@ -347,6 +353,10 @@ test('schedule pagination stores schedules and queues only one alert per schedul
     ({ request }) => request.operationName === 'searchScheduleCards',
   );
   assert.equal(scheduleRequests.length, 6);
+  for (const { request } of scheduleRequests) {
+    assert.equal(request.variables.searchScheduleRequest.country, 'United Kingdom');
+    assert.equal(request.variables.searchScheduleRequest.locale, 'en-GB');
+  }
   assert.deepEqual(
     scheduleRequests.map(({ request }) => request.variables.searchScheduleRequest.nextToken ?? null),
     [null, 'schedule-cursor-2', null, 'schedule-cursor-2', null, 'schedule-cursor-2'],
@@ -472,7 +482,7 @@ test('a partial paginated scan is recorded and completed on a later run', async 
   let pageTwoAttempt = 0;
   const firstProcess = context.createFixture({
     jobSearchResponder: async (request) => {
-      if (!request.variables.searchJobRequest.nextToken) {
+      if (!request.variables.request.nextToken) {
         return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PARTIAL-1' }], 'cursor-2');
       }
       pageTwoAttempt += 1;
@@ -489,7 +499,7 @@ test('a partial paginated scan is recorded and completed on a later run', async 
 
   const restarted = context.createFixture({
     jobSearchResponder: async (request) => {
-      if (!request.variables.searchJobRequest.nextToken) {
+      if (!request.variables.request.nextToken) {
         return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PARTIAL-1' }], 'cursor-2');
       }
       return jobPage([{ ...DEFAULT_JOB, jobId: 'JOB-PARTIAL-2' }]);
@@ -654,4 +664,162 @@ test('successful scans restart immediately without fixed-cycle sleeps', async (t
     fixture.scanner.getScanRuns().every((run) => run.status === 'COMPLETE'),
     true,
   );
+});
+
+test('hub searches reset pagination per term and deduplicate overlapping job results', async (t) => {
+  const context = createContext(t);
+  const fixture = context.createFixture({
+    jobSearchTerms: ['Dartford', 'Tilbury', ' Dartford '],
+    jobSearchResponder: async ({ variables: { request } }) => (
+      request.nextToken
+        ? jobPage([{ ...DEFAULT_JOB, jobId: `JOB-${request.query}` }])
+        : jobPage([DEFAULT_JOB], 'shared-cursor')
+    ),
+  });
+
+  const result = await fixture.scanner.runLoop1Discovery();
+  await fixture.scanner.waitForNotificationDelivery();
+
+  const requests = fixture.amazonCalls
+    .filter(({ request }) => request.operationName === 'searchJobCardsByLocation')
+    .map(({ request }) => [
+      request.variables.request.query,
+      request.variables.request.nextToken ?? null,
+    ]);
+  assert.deepEqual(requests, [
+    ['Dartford', null],
+    ['Dartford', 'shared-cursor'],
+    ['Tilbury', null],
+    ['Tilbury', 'shared-cursor'],
+  ]);
+  assert.equal(result.status, 'COMPLETE');
+  assert.equal(result.jobPagesFetched, 4);
+  assert.equal(result.jobsFound, 3);
+  assert.equal(getCount(fixture.scanner, 'amazon_jobs'), 3);
+  assert.equal(getCount(fixture.scanner, 'telegram_notifications'), 1);
+  assert.equal(fixture.telegramCalls.length, 1);
+});
+
+test('request spacing is shared by all loops and schedule requests', async (t) => {
+  const context = createContext(t);
+  const startedAt = [];
+  const delays = [];
+  const fixture = context.createFixture({
+    amazonMinimumRequestIntervalMs: 4000,
+    sleep: async (delay) => {
+      delays.push(delay);
+      context.setTime(context.getTime() + delay);
+    },
+    jobSearchResponder: async () => {
+      startedAt.push(context.getTime());
+      return jobPage([DEFAULT_JOB]);
+    },
+    scheduleResponder: async () => {
+      startedAt.push(context.getTime());
+      return schedulePage();
+    },
+  });
+
+  await fixture.scanner.runLoop1Discovery();
+  await fixture.scanner.runLoop2Schedules();
+  await fixture.scanner.runLoop3Recovery();
+
+  assert.equal(startedAt.length, 6);
+  assert.deepEqual(
+    startedAt.map((time) => time - BASE_TIME),
+    [0, 4000, 8000, 12000, 16000, 20000],
+  );
+  assert.deepEqual(delays, [4000, 4000, 4000, 4000, 4000]);
+});
+
+test('403 stops the remaining hub searches and honors a longer Retry-After', async (t) => {
+  const context = createContext(t);
+  const fixture = context.createFixture({
+    jobSearchTerms: ['Dartford', 'Tilbury'],
+    jobSearchResponder: async () => response({}, 403, { 'retry-after': '1800' }),
+  });
+
+  assert.equal((await fixture.scanner.runLoop1Discovery()).status, 'BLOCKED');
+  assert.equal((await fixture.scanner.runLoop2Schedules()).status, 'BLOCKED');
+  assert.equal((await fixture.scanner.runLoop3Recovery()).status, 'BLOCKED');
+  assert.equal(fixture.amazonCalls.length, 1);
+  const row = fixture.scanner.db.prepare(
+    "SELECT value FROM amazon_control WHERE key = 'cooldown_until'",
+  ).get();
+  assert.equal(Date.parse(row.value) - BASE_TIME, 1800000);
+});
+
+test('GraphQL input failures identify the term and structured fields without logging arbitrary extensions', async (t) => {
+  const context = createContext(t);
+  const fixture = context.createFixture({
+    jobSearchTerms: ['Dartford', 'Tilbury'],
+    jobSearchResponder: async () => response({
+      errors: [{
+        message: 'Invalid input',
+        path: ['searchJobCardsByLocation'],
+        locations: [{ line: 2, column: 3 }],
+        extensions: { code: 'INVALID_INPUT', debug: 'must-not-be-logged' },
+      }],
+    }),
+  });
+
+  const result = await fixture.scanner.runLoop1Discovery();
+  assert.equal(result.status, 'FAILED');
+  assert.equal(result.paginationComplete, false);
+  assert.equal(result.jobPagesFetched, 0);
+  assert.equal(fixture.amazonCalls.length, 1);
+  assert.match(result.error, /Dartford/);
+  assert.match(result.error, /code=INVALID_INPUT/);
+  assert.match(result.error, /path=searchJobCardsByLocation/);
+  assert.match(result.error, /locations=2:3/);
+  assert.doesNotMatch(result.error, /must-not-be-logged/);
+  assert.equal(getCount(fixture.scanner, 'telegram_notifications'), 0);
+});
+
+test('simultaneous loops wait their turn at the shared request pacer', async (t) => {
+  const context = createContext(t);
+  const waiting = [];
+  const starts = [];
+  const fixture = context.createFixture({
+    maxCyclesPerLoop: 1,
+    amazonMinimumRequestIntervalMs: 4000,
+    sleep: (delay) => new Promise((resolveWait) => waiting.push({ delay, resolveWait })),
+    jobSearchResponder: async () => {
+      starts.push(context.getTime() - BASE_TIME);
+      return jobPage();
+    },
+  });
+  const flush = () => new Promise((resolveFlush) => setImmediate(resolveFlush));
+
+  fixture.scanner.start();
+  await flush();
+  assert.deepEqual(starts, [0]);
+  assert.equal(waiting.length, 1);
+
+  for (const expectedStart of [4000, 8000]) {
+    const next = waiting.shift();
+    assert.equal(next.delay, 4000);
+    context.setTime(BASE_TIME + expectedStart);
+    next.resolveWait();
+    await flush();
+  }
+  await fixture.scanner.waitForLoops();
+  assert.deepEqual(starts, [0, 4000, 8000]);
+  assert.equal(waiting.length, 0);
+});
+
+test('a restarted process retains a forbidden-response cooldown', async (t) => {
+  const context = createContext(t);
+  const first = context.createFixture({
+    jobSearchResponder: async () => response({}, 403),
+  });
+  assert.equal((await first.scanner.runLoop1Discovery()).status, 'BLOCKED');
+  first.close();
+
+  const restarted = context.createFixture();
+  assert.equal((await restarted.scanner.runLoop2Schedules()).status, 'BLOCKED');
+  assert.equal(restarted.amazonCalls.length, 0);
+  context.setTime(BASE_TIME + 15 * 60 * 1000);
+  assert.equal((await restarted.scanner.runLoop3Recovery()).status, 'COMPLETE');
+  assert.equal(restarted.amazonCalls.length, 1);
 });
