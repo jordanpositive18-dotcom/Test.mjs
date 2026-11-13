@@ -74,10 +74,20 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// 5. Core Scanning Function
+// 5. Core Scanning & Parsing Logic
 async function scanShifts() {
   try {
-    const res = await fetch(url, {
+    // Step A: Search for job cards by location
+    const jobSearchQuery = `
+      query SearchJobCardsByLocation($request: SearchJobRequest!) {
+        searchJobCardsByLocation(request: $request) {
+          jobId
+          __typename
+        }
+      }
+    `;
+
+    const jobRes = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -86,41 +96,114 @@ async function scanShifts() {
         'Origin': 'https://www.jobsatamazon.co.uk',
         'Referer': 'https://www.jobsatamazon.co.uk/',
       },
-      body: JSON.stringify({ query: '{ __typename }' }),
+      body: JSON.stringify({
+        query: jobSearchQuery,
+        variables: {
+          request: {
+            country: "GB",
+            locale: "en_GB",
+            query: "Dartford" // Target location / query filter
+          }
+        }
+      }),
       dispatcher,
     });
 
-    console.log(`[${new Date().toISOString()}] Scan status: ${res.status}`);
+    console.log(`[${new Date().toISOString()}] Job Search Scan status: ${jobRes.status}`);
 
-    // Even if status fluctuates, you can add your schedule parser here:
-    // const discoveredSchedules = parseSchedulesFromResponse(data);
-    // for (const shift of discoveredSchedules) {
-    //   const exists = checkStmt.get(shift.id);
-    //   if (!exists) {
-    //     insertStmt.run(shift.id, new Date().toISOString());
-    //     const message = formatShiftAlert(shift);
-    //     await sendTelegramAlert(message);
-    //   }
-    // }
+    if (jobRes.status === 200) {
+      const jobData = await jobRes.json();
+      const jobCards = jobData?.data?.searchJobCardsByLocation || [];
+      console.log(`🔍 Found ${jobCards.length} job card(s). Fetching schedules...`);
 
+      // Step B: For each job ID, fetch schedule cards
+      for (const job of jobCards) {
+        const jobId = job.jobId;
+        if (!jobId) continue;
+
+        const scheduleQuery = `
+          query SearchScheduleCards($request: SearchScheduleRequest!) {
+            searchScheduleCards(request: $request) {
+              scheduleId
+              hireStartDate
+              basePay
+              hoursPerWeek
+              workingDays
+              startTime
+              finishTime
+              location
+              postcode
+            }
+          }
+        `;
+
+        const schedRes = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': auth,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Origin': 'https://www.jobsatamazon.co.uk',
+            'Referer': 'https://www.jobsatamazon.co.uk/',
+          },
+          body: JSON.stringify({
+            query: scheduleQuery,
+            variables: {
+              request: {
+                jobId: jobId,
+                country: "GB",
+                locale: "en_GB"
+              }
+            }
+          }),
+          dispatcher,
+        });
+
+        if (schedRes.status === 200) {
+          const schedData = await schedRes.json();
+          const schedules = schedData?.data?.searchScheduleCards || [];
+
+          for (const sch of schedules) {
+            const shiftId = sch.scheduleId || `${jobId}-${sch.startTime}`;
+            
+            // Check SQLite deduplication
+            const exists = checkStmt.get(shiftId);
+            if (!exists) {
+              // Save to SQLite so we never alert twice for the same shift
+              insertStmt.run(shiftId, new Date().toISOString());
+
+              // Map properties to your exact template format
+              const shiftInfo = {
+                location: sch.location || "London, England (Dartford area) DA17 6AS",
+                postcode: sch.postcode || "DA17 6AS",
+                pay: sch.basePay || "16.10",
+                startDate: sch.hireStartDate || "21 Nov 2026",
+                workingDays: sch.workingDays || "Sat, Sun, Mon, Tue, Wed",
+                shiftTime: `${sch.startTime || "7:00"} - ${sch.finishTime || "13:30"}`,
+                hoursPerWeek: sch.hoursPerWeek || "30"
+              };
+
+              const message = formatShiftAlert(shiftInfo);
+              await sendTelegramAlert(message);
+              console.log(`🚨 New shift detected and alert sent for ID: ${shiftId}`);
+            }
+          }
+        }
+      }
+    } else {
+      const errText = await jobRes.text();
+      console.warn(`⚠️ Non-200 status code during job scan: ${jobRes.status}`, errText);
+    }
   } catch (error) {
     console.error('❌ Error during scan cycle:', error.message);
   }
 }
 
 // 6. Continuous Loop Execution
-console.log('🚀 Starting 24/7 Amazon Shift Tracker on Railway...');
+console.log('🚀 Starting 24/7 Live Amazon Shift Tracker on Railway...');
 
-// Send an immediate test message on startup to verify Telegram is working!
-await sendTelegramAlert("🚀 *Amazon Tracker Deployed Successfully!*\nTesting your custom alert format:\n\n" + formatShiftAlert({
-  location: "London, England (Dartford area) DA17 6AS",
-  postcode: "DA17 6AS",
-  pay: "16.10",
-  startDate: "21 Nov 2026",
-  workingDays: "Sat, Sun, Mon, Tue, Wed",
-  shiftTime: "7:00 - 13:30",
-  hoursPerWeek: "30"
-}));
+// Optional startup test message to verify Telegram connectivity
+await sendTelegramAlert("🚀 *Amazon Live Shift Tracker Online!*\nScanning every 60 seconds...");
 
 await scanShifts();
 setInterval(scanShifts, CHECK_INTERVAL_MS);
