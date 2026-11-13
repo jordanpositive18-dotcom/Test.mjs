@@ -1,33 +1,41 @@
 import { ProxyAgent, fetch } from 'undici';
 import Database from 'better-sqlite3';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
-// 1. Environment & Config
-const url = 'https://www.jobsatamazon.co.uk/graphql';
-let auth = process.env.AMAZON_AUTHORIZATION;
-let proxyUrl = process.env.AMAZON_PROXY_URL;
-const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const AMAZON_GRAPHQL_URL = 'https://www.jobsatamazon.co.uk/graphql';
+const UK_REGIONS = [
+  "England", "Scotland", "Wales", "Northern Ireland",
+  "London", "Manchester", "Birmingham", "Glasgow", "Edinburgh",
+  "Cardiff", "Belfast", "Bristol", "Leeds", "Newcastle",
+  "Sheffield", "Southampton", "Liverpool", "Nottingham", "Leicester"
+];
 
-if (!auth || !proxyUrl) {
-  console.error('❌ Missing required environment variables (AMAZON_AUTHORIZATION or AMAZON_PROXY_URL)');
-  process.exit(1);
-}
+export function createScanner(options = {}) {
+const {
+  fetchImpl = fetch,
+  databasePath = 'database.sqlite',
+  database: suppliedDatabase,
+  dispatcher,
+  auth = '',
+  telegramToken,
+  telegramChatId,
+  regions = UK_REGIONS,
+  sendTelegram: telegramOverride,
+  sleep = (milliseconds) => new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds)),
+  logger = console,
+} = options;
+const url = options.url ?? AMAZON_GRAPHQL_URL;
+const TG_TOKEN = telegramToken;
+const TG_CHAT_ID = telegramChatId;
+const db = suppliedDatabase ?? new Database(databasePath);
+const wait = (milliseconds) => sleep(milliseconds);
+const fetchAmazon = (requestUrl, requestOptions) => fetchImpl(
+  requestUrl,
+  dispatcher ? { ...requestOptions, dispatcher } : requestOptions
+);
 
-// Clean proxy URL
-proxyUrl = proxyUrl.replace(/["']/g, '').trim();
-const spaceIdx = proxyUrl.indexOf(' ');
-if (spaceIdx !== -1) {
-    proxyUrl = proxyUrl.substring(0, spaceIdx);
-}
-
-if (!auth.startsWith('Bearer ') && !auth.startsWith('Basic ')) {
-    auth = `Bearer ${auth}`;
-}
-
-const dispatcher = new ProxyAgent(proxyUrl);
-
-// 2. Initialize Shared SQLite Database & Tables for Nationwide 3-Loop Architecture
-const db = new Database('database.sqlite');
+// 1. Initialize Shared SQLite Database & Tables for Nationwide 3-Loop Architecture
 db.exec(`
   CREATE TABLE IF NOT EXISTS seen_schedules (
     id TEXT PRIMARY KEY,
@@ -69,14 +77,6 @@ const getFailedStmt = db.prepare('SELECT * FROM failed_requests WHERE retry_coun
 const updateFailedStmt = db.prepare('UPDATE failed_requests SET retry_count = retry_count + 1, last_tried = ? WHERE id = ?');
 const deleteFailedStmt = db.prepare('DELETE FROM failed_requests WHERE id = ?');
 
-// Nationwide UK regions & search hubs covering England, Scotland, Wales, and Northern Ireland
-const UK_REGIONS = [
-  "England", "Scotland", "Wales", "Northern Ireland",
-  "London", "Manchester", "Birmingham", "Glasgow", "Edinburgh", 
-  "Cardiff", "Belfast", "Bristol", "Leeds", "Newcastle", 
-  "Sheffield", "Southampton", "Liverpool", "Nottingham", "Leicester"
-];
-
 // 3. Telegram Message Formatter matching exact user layout
 function formatShiftAlert(shift) {
   return `1️⃣ 📍 ${shift.location}
@@ -89,22 +89,26 @@ function formatShiftAlert(shift) {
 }
 
 async function sendTelegramAlert(message) {
+  if (telegramOverride) {
+    await telegramOverride(message);
+    return;
+  }
   if (!TG_TOKEN || !TG_CHAT_ID) {
-    console.log('📱 [Telegram Mock Alert]:\n', message);
+    logger.log('📱 [Telegram Mock Alert]:\n', message);
     return;
   }
   try {
     const tgUrl = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-    const res = await fetch(tgUrl, {
+    const res = await fetchImpl(tgUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message })
     });
     if (!res.ok) {
-      console.error(`⚠️ Telegram API returned status ${res.status}`);
+      logger.error(`⚠️ Telegram API returned status ${res.status}`);
     }
   } catch (err) {
-    console.error('⚠️ Failed to send Telegram notification:', err.message);
+    logger.error('⚠️ Failed to send Telegram notification:', err.message);
   }
 }
 
@@ -121,8 +125,8 @@ const amazonHeaders = {
 // LOOP 1: Nationwide Job Discovery & Pagination
 // ----------------------------------------------------
 async function runLoop1Discovery() {
-  console.log('🌍 [Loop 1] Starting nationwide UK job discovery scan across regions...');
-  for (const region of UK_REGIONS) {
+  logger.log('🌍 [Loop 1] Starting nationwide UK job discovery scan across regions...');
+  for (const region of regions) {
     try {
       const jobSearchQuery = `
         query SearchJobCardsByLocation($request: SearchJobRequest!) {
@@ -133,7 +137,7 @@ async function runLoop1Discovery() {
         }
       `;
 
-      const res = await fetch(url, {
+      const res = await fetchAmazon(url, {
         method: 'POST',
         headers: amazonHeaders,
         body: JSON.stringify({
@@ -161,19 +165,19 @@ async function runLoop1Discovery() {
             addedCount++;
           }
         }
-        console.log(`🌍 [Loop 1] Region [${region}]: Found ${jobCards.length} jobs (${addedCount} queued/updated).`);
+        logger.log(`🌍 [Loop 1] Region [${region}]: Found ${jobCards.length} jobs (${addedCount} queued/updated).`);
       } else {
         const errText = await res.text();
-        console.warn(`⚠️ [Loop 1] Region [${region}] returned status ${res.status}`);
+        logger.warn(`⚠️ [Loop 1] Region [${region}] returned status ${res.status}`);
         insertFailedStmt.run('LOOP1_DISCOVERY', JSON.stringify({ region }), `HTTP ${res.status}: ${errText}`, 0, new Date().toISOString());
       }
     } catch (error) {
-      console.error(`❌ [Loop 1 error in region ${region}]:`, error.message);
+      logger.error(`❌ [Loop 1 error in region ${region}]:`, error.message);
       insertFailedStmt.run('LOOP1_DISCOVERY', JSON.stringify({ region }), error.message, 0, new Date().toISOString());
     }
 
     // Controlled pacing between region requests
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await wait(3000);
   }
 }
 
@@ -181,11 +185,11 @@ async function runLoop1Discovery() {
 // LOOP 2: Schedule Processing & Detailed Retrieval
 // ----------------------------------------------------
 async function runLoop2Schedules() {
-  console.log('⚡ [Loop 2] Processing pending job queue for schedule details...');
+  logger.log('⚡ [Loop 2] Processing pending job queue for schedule details...');
   try {
     const pendingJobs = getPendingJobsStmt.all();
     if (pendingJobs.length === 0) {
-      console.log('⚡ [Loop 2] No pending jobs in queue.');
+      logger.log('⚡ [Loop 2] No pending jobs in queue.');
       return;
     }
 
@@ -207,7 +211,7 @@ async function runLoop2Schedules() {
           }
         `;
 
-        const res = await fetch(url, {
+        const res = await fetchAmazon(url, {
           method: 'POST',
           headers: amazonHeaders,
           body: JSON.stringify({
@@ -246,28 +250,28 @@ async function runLoop2Schedules() {
 
               const alertMsg = formatShiftAlert(shiftInfo);
               await sendTelegramAlert(alertMsg);
-              console.log(`🚨 [Loop 2] New shift discovered & alerted! ID: ${shiftId}`);
+              logger.log(`🚨 [Loop 2] New shift discovered & alerted! ID: ${shiftId}`);
             }
           }
 
           markJobProcessedStmt.run(job.job_id);
         } else {
           const errText = await res.text();
-          console.warn(`⚠️ [Loop 2] Job ${job.job_id} schedule fetch returned status ${res.status}`);
+          logger.warn(`⚠️ [Loop 2] Job ${job.job_id} schedule fetch returned status ${res.status}`);
           markJobFailedStmt.run(job.job_id);
           insertFailedStmt.run('LOOP2_SCHEDULE', JSON.stringify({ jobId: job.job_id }), `HTTP ${res.status}: ${errText}`, 0, new Date().toISOString());
         }
       } catch (err) {
-        console.error(`❌ [Loop 2 error for job ${job.job_id}]:`, err.message);
+        logger.error(`❌ [Loop 2 error for job ${job.job_id}]:`, err.message);
         markJobFailedStmt.run(job.job_id);
         insertFailedStmt.run('LOOP2_SCHEDULE', JSON.stringify({ jobId: job.job_id }), err.message, 0, new Date().toISOString());
       }
 
       // Pacing between schedule requests
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      await wait(2000);
     }
   } catch (error) {
-    console.error('❌ [Loop 2 fatal error]:', error.message);
+    logger.error('❌ [Loop 2 fatal error]:', error.message);
   }
 }
 
@@ -275,16 +279,16 @@ async function runLoop2Schedules() {
 // LOOP 3: Error Recovery, Failed Requests & Safe Retries
 // ----------------------------------------------------
 async function runLoop3Recovery() {
-  console.log('🛡️ [Loop 3] Checking error logs and retrying failed tasks safely...');
+  logger.log('🛡️ [Loop 3] Checking error logs and retrying failed tasks safely...');
   try {
     const failedTasks = getFailedStmt.all();
     if (failedTasks.length === 0) {
-      console.log('🛡️ [Loop 3] No failed tasks requiring retry.');
+      logger.log('🛡️ [Loop 3] No failed tasks requiring retry.');
       return;
     }
 
     for (const task of failedTasks) {
-      console.log(`🛡️ [Loop 3] Retrying failed task #${task.id} (${task.task_type})...`);
+      logger.log(`🛡️ [Loop 3] Retrying failed task #${task.id} (${task.task_type})...`);
       const payloadData = JSON.parse(task.payload || '{}');
       const now = new Date().toISOString();
 
@@ -299,7 +303,7 @@ async function runLoop3Recovery() {
               }
             }
           `;
-          const res = await fetch(url, {
+          const res = await fetchAmazon(url, {
             method: 'POST',
             headers: amazonHeaders,
             body: JSON.stringify({
@@ -315,7 +319,7 @@ async function runLoop3Recovery() {
               if (job && job.jobId) upsertJobStmt.run(job.jobId, region, now);
             }
             deleteFailedStmt.run(task.id);
-            console.log(`✅ [Loop 3] Retry successful for region ${region}`);
+            logger.log(`✅ [Loop 3] Retry successful for region ${region}`);
           } else {
             updateFailedStmt.run(now, task.id);
           }
@@ -336,7 +340,7 @@ async function runLoop3Recovery() {
               }
             }
           `;
-          const res = await fetch(url, {
+          const res = await fetchAmazon(url, {
             method: 'POST',
             headers: amazonHeaders,
             body: JSON.stringify({
@@ -347,46 +351,86 @@ async function runLoop3Recovery() {
           });
           if (res.status === 200) {
             deleteFailedStmt.run(task.id);
-            console.log(`✅ [Loop 3] Retry successful for job ${jobId}`);
+            logger.log(`✅ [Loop 3] Retry successful for job ${jobId}`);
           } else {
             updateFailedStmt.run(now, task.id);
           }
         }
       } catch (retryErr) {
-        console.error(`❌ [Loop 3 retry error for task ${task.id}]:`, retryErr.message);
+        logger.error(`❌ [Loop 3 retry error for task ${task.id}]:`, retryErr.message);
         updateFailedStmt.run(now, task.id);
       }
 
-      await new Promise(resolve => setTimeout(resolve, 3000));
+      await wait(3000);
     }
   } catch (error) {
-    console.error('❌ [Loop 3 fatal error]:', error.message);
+    logger.error('❌ [Loop 3 fatal error]:', error.message);
   }
 }
 
-// ----------------------------------------------------
-// Three-Loop Staggered Startup & Execution Coordinator
-// ----------------------------------------------------
-console.log('🚀 Starting Nationwide UK Amazon Shift Tracker (Three-Loop Architecture)...');
+async function start() {
+  logger.log('🚀 Starting Nationwide UK Amazon Shift Tracker (Three-Loop Architecture)...');
+  await sendTelegramAlert("🚀 *Nationwide UK Amazon Shift Tracker Online!*\nThree-Loop Architecture (Discovery + Schedule Processing + Error Recovery) initiated.");
 
-await sendTelegramAlert("🚀 *Nationwide UK Amazon Shift Tracker Online!*\nThree-Loop Architecture (Discovery + Schedule Processing + Error Recovery) initiated.");
+  // Initial immediate run of Loop 1
+  await runLoop1Discovery();
 
-// Initial immediate run of Loop 1
-await runLoop1Discovery();
+  // Start Loop 1 continuous cycle (every 60 seconds)
+  setInterval(runLoop1Discovery, 60 * 1000);
 
-// Start Loop 1 continuous cycle (every 60 seconds)
-setInterval(runLoop1Discovery, 60 * 1000);
+  // Stagger Loop 2 start by 5 seconds
+  setTimeout(() => {
+    logger.log('⚡ Initializing Loop 2 (Schedule Processing)...');
+    runLoop2Schedules();
+    setInterval(runLoop2Schedules, 30 * 1000);
+  }, 5000);
 
-// Stagger Loop 2 start by 5 seconds
-setTimeout(() => {
-  console.log('⚡ Initializing Loop 2 (Schedule Processing)...');
-  runLoop2Schedules();
-  setInterval(runLoop2Schedules, 30 * 1000);
-}, 5000);
+  // Stagger Loop 3 start by 10 seconds
+  setTimeout(() => {
+    logger.log('🛡️ Initializing Loop 3 (Error Recovery & Retries)...');
+    runLoop3Recovery();
+    setInterval(runLoop3Recovery, 90 * 1000);
+  }, 10000);
+}
 
-// Stagger Loop 3 start by 10 seconds
-setTimeout(() => {
-  console.log('🛡️ Initializing Loop 3 (Error Recovery & Retries)...');
-  runLoop3Recovery();
-  setInterval(runLoop3Recovery, 90 * 1000);
-}, 10000);
+return {
+  db,
+  runLoop1Discovery,
+  runLoop2Schedules,
+  runLoop3Recovery,
+  sendTelegramAlert,
+  start,
+  close: () => db.close(),
+};
+}
+
+const isDirectExecution = process.argv[1]
+  && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isDirectExecution) {
+  let auth = process.env.AMAZON_AUTHORIZATION;
+  let proxyUrl = process.env.AMAZON_PROXY_URL;
+
+  if (!auth || !proxyUrl) {
+    console.error('❌ Missing required environment variables (AMAZON_AUTHORIZATION or AMAZON_PROXY_URL)');
+    process.exit(1);
+  }
+
+  proxyUrl = proxyUrl.replace(/["']/g, '').trim();
+  const spaceIdx = proxyUrl.indexOf(' ');
+  if (spaceIdx !== -1) {
+    proxyUrl = proxyUrl.substring(0, spaceIdx);
+  }
+
+  if (!auth.startsWith('Bearer ') && !auth.startsWith('Basic ')) {
+    auth = `Bearer ${auth}`;
+  }
+
+  const scanner = createScanner({
+    auth,
+    dispatcher: new ProxyAgent(proxyUrl),
+    telegramToken: process.env.TELEGRAM_BOT_TOKEN,
+    telegramChatId: process.env.TELEGRAM_CHAT_ID,
+  });
+  await scanner.start();
+}
