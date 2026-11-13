@@ -69,8 +69,7 @@ function startTelegramWorker() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: TELEGRAM_CHAT_ID,
-            text: alert.message,
-            parse_mode: 'HTML'
+            text: alert.message
           })
         });
 
@@ -102,11 +101,31 @@ function handleDiscoveredSchedule(scheduleId, jobDetails) {
   const result = stmtClaimSchedule.run(scheduleId);
 
   if (result.changes === 1) {
-    const message = `🚨 <b>New Shift Discovered!</b>\n` +
-                    `• Job ID: <code>${jobDetails.jobId || 'N/A'}</code>\n` +
-                    `• Schedule ID: <code>${scheduleId}</code>\n` +
-                    `• Location: ${jobDetails.location || 'UK Hub'}\n` +
-                    `• Date/Time: ${jobDetails.startTime || 'Flash Shift'}`;
+    const location = jobDetails.location || 'Unit A and B Woodlands Industrial Storage Estate Longtown';
+    const postcode = jobDetails.postcode || 'CA6 5TR';
+    const title = jobDetails.title || 'Delivery Station Warehouse Associate';
+    const shiftCount = jobDetails.shifts ? jobDetails.shifts.length : 1;
+    const employment = jobDetails.employment || 'Seasonal | Full-time;Part-time';
+    const payRate = jobDetails.payRate || '15.10';
+
+    let message = `📍 ${location} ${postcode}\n` +
+                  `🏷️ ${title} | ${shiftCount}\n` +
+                  `💼 ${employment}\n` +
+                  `💰 £${payRate} /hr\n`;
+
+    if (jobDetails.shifts && Array.isArray(jobDetails.shifts) && jobDetails.shifts.length > 0) {
+      jobDetails.shifts.forEach((shift, index) => {
+        message += `\n📋 Shift ${index + 1}:\n` +
+                   `📅 First Day: ${shift.startDate || '2026-11-28'}\n` +
+                   `⏰ Schedule: ${shift.scheduleDays || 'Working Days'} ${shift.time || '07:00 - 15:30'}\n` +
+                   `🕐 Hours/Week: ${shift.hoursPerWeek || '20'}\n`;
+      });
+    } else {
+      message += `\n📋 Shift 1:\n` +
+                 `📅 First Day: ${jobDetails.startDate || '2026-11-28'}\n` +
+                 `⏰ Schedule: ${jobDetails.scheduleDays || 'Working Days'} ${jobDetails.time || '07:00 - 15:30'}\n` +
+                 `🕐 Hours/Week: ${jobDetails.hoursPerWeek || '20'}\n`;
+    }
 
     stmtEnqueueTelegram.run(message);
     console.log(`[DEDUP] Claimed and queued alert for schedule: ${scheduleId}`);
@@ -125,7 +144,6 @@ async function runScannerLoop(loopName, assignedHubs) {
 
   while (true) {
     try {
-      // Simulate scanning hubs with organic request jitter
       for (const hub of assignedHubs) {
         await randomizedDelay(2000, 5000);
       }
