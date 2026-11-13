@@ -1,5 +1,6 @@
 import { ProxyAgent, fetch } from 'undici';
 import Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -21,7 +22,12 @@ const {
   telegramToken,
   telegramChatId,
   regions = UK_REGIONS,
-  sendTelegram: telegramOverride,
+  telegramTransport,
+  telegramTimeoutMs = 15000,
+  notificationClaimLeaseMs = 60000,
+  notificationBaseBackoffMs = 5000,
+  notificationMaxBackoffMs = 60 * 60 * 1000,
+  clock = () => Date.now(),
   sleep = (milliseconds) => new Promise(resolveSleep => setTimeout(resolveSleep, milliseconds)),
   logger = console,
 } = options;
@@ -30,6 +36,7 @@ const TG_TOKEN = telegramToken;
 const TG_CHAT_ID = telegramChatId;
 const db = suppliedDatabase ?? new Database(databasePath);
 const wait = (milliseconds) => sleep(milliseconds);
+const nowIso = () => new Date(clock()).toISOString();
 const fetchAmazon = (requestUrl, requestOptions) => fetchImpl(
   requestUrl,
   dispatcher ? { ...requestOptions, dispatcher } : requestOptions
@@ -57,6 +64,25 @@ db.exec(`
     retry_count INTEGER DEFAULT 0,
     last_tried TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS telegram_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id TEXT NOT NULL UNIQUE,
+    message TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'PENDING'
+      CHECK (status IN ('PENDING', 'CLAIMED', 'SENT')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    last_attempt_at TEXT,
+    claim_token TEXT,
+    claim_expires_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    sent_at TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS telegram_notifications_ready_idx
+    ON telegram_notifications(status, next_attempt_at, claim_expires_at);
 `);
 
 const checkSeenStmt = db.prepare('SELECT id FROM seen_schedules WHERE id = ?');
@@ -76,6 +102,90 @@ const insertFailedStmt = db.prepare('INSERT INTO failed_requests (task_type, pay
 const getFailedStmt = db.prepare('SELECT * FROM failed_requests WHERE retry_count < 3 LIMIT 5');
 const updateFailedStmt = db.prepare('UPDATE failed_requests SET retry_count = retry_count + 1, last_tried = ? WHERE id = ?');
 const deleteFailedStmt = db.prepare('DELETE FROM failed_requests WHERE id = ?');
+const insertNotificationStmt = db.prepare(`
+  INSERT OR IGNORE INTO telegram_notifications
+    (schedule_id, message, status, attempt_count, next_attempt_at, created_at)
+  VALUES (?, ?, 'PENDING', 0, ?, ?)
+`);
+const findClaimableNotificationStmt = db.prepare(`
+  SELECT *
+  FROM telegram_notifications
+  WHERE (status = 'PENDING' AND next_attempt_at <= ?)
+     OR (status = 'CLAIMED' AND claim_expires_at <= ?)
+  ORDER BY next_attempt_at, id
+  LIMIT 1
+`);
+const claimNotificationStmt = db.prepare(`
+  UPDATE telegram_notifications
+  SET status = 'CLAIMED',
+      attempt_count = attempt_count + 1,
+      last_attempt_at = ?,
+      claim_token = ?,
+      claim_expires_at = ?
+  WHERE id = ?
+    AND (
+      (status = 'PENDING' AND next_attempt_at <= ?)
+      OR (status = 'CLAIMED' AND claim_expires_at <= ?)
+    )
+`);
+const markNotificationSentStmt = db.prepare(`
+  UPDATE telegram_notifications
+  SET status = 'SENT',
+      sent_at = ?,
+      last_error = NULL,
+      claim_token = NULL,
+      claim_expires_at = NULL
+  WHERE id = ? AND status = 'CLAIMED' AND claim_token = ?
+`);
+const markNotificationPendingStmt = db.prepare(`
+  UPDATE telegram_notifications
+  SET status = 'PENDING',
+      next_attempt_at = ?,
+      last_error = ?,
+      claim_token = NULL,
+      claim_expires_at = NULL
+  WHERE id = ? AND status = 'CLAIMED' AND claim_token = ?
+`);
+const saveScheduleAndNotification = db.transaction((scheduleId, message, discoveredAt) => {
+  if (checkSeenStmt.get(scheduleId)) return false;
+
+  insertSeenStmt.run(scheduleId, discoveredAt);
+  const inserted = insertNotificationStmt.run(
+    scheduleId,
+    message,
+    discoveredAt,
+    discoveredAt,
+  );
+  return inserted.changes === 1;
+});
+const claimNotificationTransaction = db.transaction((now, claimExpiresAt, claimToken) => {
+  const notification = findClaimableNotificationStmt.get(now, now);
+  if (!notification) return null;
+
+  const claimed = claimNotificationStmt.run(
+    now,
+    claimToken,
+    claimExpiresAt,
+    notification.id,
+    now,
+    now,
+  );
+  if (claimed.changes !== 1) return null;
+
+  return {
+    ...notification,
+    claim_token: claimToken,
+    attempt_count: notification.attempt_count + 1,
+  };
+});
+
+function claimNextNotification(now = nowIso()) {
+  const claimToken = randomUUID();
+  const claimExpiresAt = new Date(
+    clock() + notificationClaimLeaseMs,
+  ).toISOString();
+  return claimNotificationTransaction.immediate(now, claimExpiresAt, claimToken);
+}
 
 // 3. Telegram Message Formatter matching exact user layout
 function formatShiftAlert(shift) {
@@ -88,28 +198,107 @@ function formatShiftAlert(shift) {
 🕐 Hours/Week: ${shift.hoursPerWeek}`;
 }
 
-async function sendTelegramAlert(message) {
-  if (telegramOverride) {
-    await telegramOverride(message);
-    return;
+async function requestTelegram(message, { timeout = true } = {}) {
+  const signal = timeout ? AbortSignal.timeout(telegramTimeoutMs) : undefined;
+  if (telegramTransport) {
+    return telegramTransport(message, { signal });
   }
+  if (!TG_TOKEN || !TG_CHAT_ID) {
+    throw new Error('Telegram bot token and chat ID are not configured');
+  }
+
+  const tgUrl = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
+  return fetchImpl(tgUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message }),
+    ...(signal ? { signal } : {}),
+  });
+}
+
+async function sendTelegramAlert(message) {
   if (!TG_TOKEN || !TG_CHAT_ID) {
     logger.log('📱 [Telegram Mock Alert]:\n', message);
     return;
   }
   try {
-    const tgUrl = `https://api.telegram.org/bot${TG_TOKEN}/sendMessage`;
-    const res = await fetchImpl(tgUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: TG_CHAT_ID, text: message })
-    });
+    const res = await requestTelegram(message, { timeout: false });
     if (!res.ok) {
       logger.error(`⚠️ Telegram API returned status ${res.status}`);
     }
   } catch (err) {
     logger.error('⚠️ Failed to send Telegram notification:', err.message);
   }
+}
+
+function getNotificationBackoffMs(attemptCount) {
+  const exponent = Math.min(Math.max(attemptCount - 1, 0), 30);
+  return Math.min(
+    notificationBaseBackoffMs * (2 ** exponent),
+    notificationMaxBackoffMs,
+  );
+}
+
+async function deliverPendingNotifications() {
+  let sentCount = 0;
+  let failedCount = 0;
+  const batchSize = 10;
+
+  for (let index = 0; index < batchSize; index += 1) {
+    const notification = claimNextNotification();
+    if (!notification) break;
+
+    try {
+      const response = await requestTelegram(notification.message);
+      let telegramResult;
+      try {
+        telegramResult = await response.json();
+      } catch (error) {
+        if (!response.ok) {
+          throw new Error(`Telegram returned HTTP ${response.status}`);
+        }
+        throw new Error(`Telegram returned invalid JSON: ${error.message}`);
+      }
+
+      if (!response.ok) {
+        throw new Error(`Telegram returned HTTP ${response.status}`);
+      }
+      if (telegramResult?.ok !== true) {
+        throw new Error(
+          `Telegram rejected the message: ${telegramResult?.description || 'ok was not true'}`,
+        );
+      }
+
+      const sentAt = nowIso();
+      const markedSent = markNotificationSentStmt.run(
+        sentAt,
+        notification.id,
+        notification.claim_token,
+      );
+      if (markedSent.changes === 1) {
+        sentCount += 1;
+      } else {
+        logger.warn(`⚠️ Notification ${notification.id} was delivered after its claim expired.`);
+      }
+    } catch (error) {
+      const errorMessage = String(error?.message ?? error).slice(0, 2000);
+      const retryAt = new Date(
+        clock() + getNotificationBackoffMs(notification.attempt_count),
+      ).toISOString();
+      const markedPending = markNotificationPendingStmt.run(
+        retryAt,
+        errorMessage,
+        notification.id,
+        notification.claim_token,
+      );
+      if (markedPending.changes === 1) {
+        failedCount += 1;
+        logger.error(`⚠️ Notification ${notification.id} will retry: ${errorMessage}`);
+      }
+    }
+  }
+
+  return { sentCount, failedCount };
 }
 
 // Common headers for Amazon GraphQL
@@ -190,7 +379,6 @@ async function runLoop2Schedules() {
     const pendingJobs = getPendingJobsStmt.all();
     if (pendingJobs.length === 0) {
       logger.log('⚡ [Loop 2] No pending jobs in queue.');
-      return;
     }
 
     for (const job of pendingJobs) {
@@ -233,24 +421,24 @@ async function runLoop2Schedules() {
 
           for (const sch of schedules) {
             const shiftId = sch.scheduleId || `${job.job_id}-${sch.startTime || 'unknown'}`;
-            const exists = checkSeenStmt.get(shiftId);
+            const shiftInfo = {
+              location: sch.location || `UK Location (${job.region})`,
+              postcode: sch.postcode || "N/A",
+              pay: sch.basePay || "16.10",
+              startDate: sch.hireStartDate || "Upcoming",
+              workingDays: sch.workingDays || "Flexible",
+              shiftTime: `${sch.startTime || "07:00"} - ${sch.finishTime || "15:30"}`,
+              hoursPerWeek: sch.hoursPerWeek || "30"
+            };
 
-            if (!exists) {
-              insertSeenStmt.run(shiftId, new Date().toISOString());
-
-              const shiftInfo = {
-                location: sch.location || `UK Location (${job.region})`,
-                postcode: sch.postcode || "N/A",
-                pay: sch.basePay || "16.10",
-                startDate: sch.hireStartDate || "Upcoming",
-                workingDays: sch.workingDays || "Flexible",
-                shiftTime: `${sch.startTime || "07:00"} - ${sch.finishTime || "15:30"}`,
-                hoursPerWeek: sch.hoursPerWeek || "30"
-              };
-
-              const alertMsg = formatShiftAlert(shiftInfo);
-              await sendTelegramAlert(alertMsg);
-              logger.log(`🚨 [Loop 2] New shift discovered & alerted! ID: ${shiftId}`);
+            const alertMsg = formatShiftAlert(shiftInfo);
+            const enqueued = saveScheduleAndNotification.immediate(
+              shiftId,
+              alertMsg,
+              nowIso(),
+            );
+            if (enqueued) {
+              logger.log(`🚨 [Loop 2] New shift discovered & queued for alert! ID: ${shiftId}`);
             }
           }
 
@@ -270,6 +458,7 @@ async function runLoop2Schedules() {
       // Pacing between schedule requests
       await wait(2000);
     }
+    await deliverPendingNotifications();
   } catch (error) {
     logger.error('❌ [Loop 2 fatal error]:', error.message);
   }
@@ -398,6 +587,7 @@ return {
   runLoop1Discovery,
   runLoop2Schedules,
   runLoop3Recovery,
+  runNotificationDelivery: deliverPendingNotifications,
   sendTelegramAlert,
   start,
   close: () => db.close(),
