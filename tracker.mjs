@@ -6,33 +6,6 @@ import { pathToFileURL } from 'node:url';
 
 const AMAZON_GRAPHQL_URL = 'https://www.jobsatamazon.co.uk/graphql';
 
-export const UK_HUB_SEARCH_TERMS = Object.freeze([
-  'Dartford',
-  'Tilbury',
-  'London',
-  'Dunfermline',
-  'Doncaster',
-  'Coventry',
-  'Manchester',
-  'Bristol',
-  'Birmingham',
-  'Glasgow',
-  'Edinburgh',
-  'Cardiff',
-  'Belfast',
-  'Leeds',
-  'Newcastle',
-  'Sheffield',
-  'Southampton',
-  'Liverpool',
-  'Nottingham',
-  'Leicester',
-  'Peterborough',
-  'Northampton',
-  'Milton Keynes',
-  'Swindon',
-]);
-
 export function createScanner(options = {}) {
 const {
   fetchImpl = fetch,
@@ -47,7 +20,6 @@ const {
   notificationClaimLeaseMs = 60000,
   notificationBaseBackoffMs = 5000,
   notificationMaxBackoffMs = 60 * 60 * 1000,
-  amazonPageSize = 20,
   amazonMaxConcurrentRequests = 3,
   amazonMinimumRequestIntervalMs = 4000,
   amazonRequestTimeoutMs = 15000,
@@ -56,7 +28,6 @@ const {
   amazonForbiddenCooldownMs = 15 * 60 * 1000,
   loopFailureRetryBaseMs = 1000,
   loopFailureRetryMaxMs = 60 * 1000,
-  jobSearchTerms = UK_HUB_SEARCH_TERMS,
   maxCyclesPerLoop = Infinity,
   clock = () => Date.now(),
   monotonicClock = () => performance.now(),
@@ -69,19 +40,11 @@ if (!Number.isInteger(amazonMaxConcurrentRequests) || amazonMaxConcurrentRequest
 if (!Number.isInteger(amazonMinimumRequestIntervalMs) || amazonMinimumRequestIntervalMs < 0) {
   throw new RangeError('amazonMinimumRequestIntervalMs must be a non-negative integer');
 }
-if (
-  !Array.isArray(jobSearchTerms)
-  || jobSearchTerms.length === 0
-  || jobSearchTerms.some((term) => typeof term !== 'string' || !term.trim())
-) {
-  throw new TypeError('jobSearchTerms must be a non-empty array of strings');
-}
 if (maxCyclesPerLoop !== Infinity
   && (!Number.isInteger(maxCyclesPerLoop) || maxCyclesPerLoop < 1)) {
   throw new RangeError('maxCyclesPerLoop must be a positive integer or Infinity');
 }
 const url = options.url ?? AMAZON_GRAPHQL_URL;
-const uniqueJobSearchTerms = [...new Set(jobSearchTerms.map((term) => term.trim()))];
 const TG_TOKEN = telegramToken;
 const TG_CHAT_ID = telegramChatId;
 const db = suppliedDatabase ?? new Database(databasePath);
@@ -881,58 +844,55 @@ async function runNationwideScan(loopName) {
   let schedulePaginationComplete = true;
 
   try {
-    for (const searchTerm of uniqueJobSearchTerms) {
-      const seenTokens = new Set();
-      let nextToken = null;
-      while (true) {
-        const searchJobRequest = {
-          country: 'United Kingdom',
-          locale: 'en-GB',
-          query: searchTerm,
-          ...(nextToken ? { nextToken } : {}),
-        };
-        const response = await fetchAmazon(url, {
-          method: 'POST',
-          headers: amazonHeaders,
-          body: JSON.stringify({
-            operationName: 'searchJobCardsByLocation',
-            query: JOB_SEARCH_QUERY,
-            variables: { searchJobRequest },
-          }),
-        }, metrics);
+    const seenTokens = new Set();
+    let nextToken = null;
+    while (true) {
+      const searchJobRequest = {
+        country: 'United Kingdom',
+        locale: 'en-GB',
+        ...(nextToken ? { nextToken } : {}),
+      };
+      const response = await fetchAmazon(url, {
+        method: 'POST',
+        headers: amazonHeaders,
+        body: JSON.stringify({
+          operationName: 'searchJobCardsByLocation',
+          query: JOB_SEARCH_QUERY,
+          variables: { searchJobRequest },
+        }),
+      }, metrics);
 
-        if (response.status !== 200) {
-          throw createAmazonHttpError(response, `job search for "${searchTerm}"`);
-        }
-        const payload = await response.json();
-        const graphQLError = getGraphQLErrorMessage(payload);
-        if (graphQLError) {
-          throw new Error(`Amazon job search GraphQL error for "${searchTerm}": ${graphQLError}`);
-        }
-
-        const result = payload?.data?.searchJobCardsByLocation;
-        const jobCards = Array.isArray(result)
-          ? result
-          : result?.jobCards;
-        if (!Array.isArray(jobCards)) {
-          throw new Error(`Amazon job search for "${searchTerm}" did not contain a jobCards list`);
-        }
-
-        metrics.jobPagesFetched += 1;
-        for (const job of jobCards) {
-          if (!job?.jobId) continue;
-          saveDiscoveredJob.immediate(job, nowIso());
-          foundJobs.set(job.jobId, job);
-        }
-
-        const pageToken = Array.isArray(result) ? null : result?.nextToken;
-        if (!pageToken) break;
-        if (seenTokens.has(pageToken)) {
-          throw new Error(`Amazon job search returned a repeated pagination token for "${searchTerm}"`);
-        }
-        seenTokens.add(pageToken);
-        nextToken = pageToken;
+      if (response.status !== 200) {
+        throw createAmazonHttpError(response, 'UK job search');
       }
+      const payload = await response.json();
+      const graphQLError = getGraphQLErrorMessage(payload);
+      if (graphQLError) {
+        throw new Error(`Amazon UK job search GraphQL error: ${graphQLError}`);
+      }
+
+      const result = payload?.data?.searchJobCardsByLocation;
+      const jobCards = Array.isArray(result)
+        ? result
+        : result?.jobCards;
+      if (!Array.isArray(jobCards)) {
+        throw new Error('Amazon UK job search did not contain a jobCards list');
+      }
+
+      metrics.jobPagesFetched += 1;
+      for (const job of jobCards) {
+        if (!job?.jobId) continue;
+        saveDiscoveredJob.immediate(job, nowIso());
+        foundJobs.set(job.jobId, job);
+      }
+
+      const pageToken = Array.isArray(result) ? null : result?.nextToken;
+      if (!pageToken) break;
+      if (seenTokens.has(pageToken)) {
+        throw new Error('Amazon UK job search returned a repeated pagination token');
+      }
+      seenTokens.add(pageToken);
+      nextToken = pageToken;
     }
     jobPaginationComplete = true;
   } catch (scanError) {
@@ -1021,7 +981,7 @@ async function runSingleLoopPass(loopName, isRunning, setRunning) {
 
   setRunning(true);
   try {
-    logger.log(`[${loopName}] Starting a UK hub-term scan across ${uniqueJobSearchTerms.length} terms.`);
+    logger.log(`[${loopName}] Starting a UK country-wide scan.`);
     const result = await runNationwideScan(loopName);
     kickNotificationDelivery();
     return result;
@@ -1061,15 +1021,6 @@ async function retrieveSchedulesForJob(job, metrics) {
       country: 'United Kingdom',
       locale: 'en-GB',
       jobId,
-      keyWords: '',
-      pageSize: amazonPageSize,
-      equalFilters: [],
-      containFilters: [],
-      rangeFilters: [],
-      orFilters: [],
-      dateFilters: [],
-      excludeFilters: [],
-      consolidateSchedule: true,
       ...(nextToken ? { nextToken } : {}),
     };
     const response = await fetchAmazon(url, {
@@ -1185,7 +1136,7 @@ async function runContinuousLoop(loopName, runPass) {
 function start() {
   if (loopsStarted) return { status: 'ALREADY_RUNNING', loops: 3 };
   logger.log(
-    `🚀 Starting exactly three simultaneous UK hub-term scan loops; `
+    `🚀 Starting exactly three simultaneous UK country-wide scan loops; `
     + `maximum Amazon request concurrency=${amazonMaxConcurrentRequests}; `
     + `minimum shared request spacing=${amazonMinimumRequestIntervalMs}ms.`,
   );
@@ -1198,7 +1149,7 @@ function start() {
   ].map(([loopName, runPass]) => runContinuousLoop(loopName, runPass));
 
   void sendTelegramAlert(
-    '🚀 *UK Amazon Shift Tracker Online!*\nThree simultaneous hub-term scan loops initiated.',
+    '🚀 *UK Amazon Shift Tracker Online!*\nThree simultaneous country-wide scan loops initiated.',
   ).catch((error) => logger.error('⚠️ Startup Telegram alert failed:', error.message));
   return { status: 'STARTED', loops: 3 };
 }
