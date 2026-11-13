@@ -154,8 +154,8 @@ test('all three loops independently search the same complete hub list without bl
   for (let index = 0; index < searches.length; index += 1) {
     const { request } = searches[index];
     assert.deepEqual(request.variables.request, {
-      country: 'GB',
-      locale: 'en_GB',
+      country: 'United Kingdom',
+      locale: 'en-GB',
       query: UK_HUB_SEARCH_TERMS[index % UK_HUB_SEARCH_TERMS.length],
     });
     assert.match(request.query, /nextToken/);
@@ -353,6 +353,10 @@ test('schedule pagination stores schedules and queues only one alert per schedul
     ({ request }) => request.operationName === 'searchScheduleCards',
   );
   assert.equal(scheduleRequests.length, 6);
+  for (const { request } of scheduleRequests) {
+    assert.equal(request.variables.searchScheduleRequest.country, 'United Kingdom');
+    assert.equal(request.variables.searchScheduleRequest.locale, 'en-GB');
+  }
   assert.deepEqual(
     scheduleRequests.map(({ request }) => request.variables.searchScheduleRequest.nextToken ?? null),
     [null, 'schedule-cursor-2', null, 'schedule-cursor-2', null, 'schedule-cursor-2'],

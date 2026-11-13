@@ -887,8 +887,8 @@ async function runNationwideScan(loopName) {
       let nextToken = null;
       while (true) {
         const request = {
-          country: 'GB',
-          locale: 'en_GB',
+          country: 'United Kingdom',
+          locale: 'en-GB',
           query: searchTerm,
           ...(nextToken ? { nextToken } : {}),
         };
@@ -1059,8 +1059,8 @@ async function retrieveSchedulesForJob(job, metrics) {
 
   while (true) {
     const searchScheduleRequest = {
-      country: 'GB',
-      locale: 'en_GB',
+      country: 'United Kingdom',
+      locale: 'en-GB',
       jobId,
       keyWords: '',
       pageSize: amazonPageSize,
