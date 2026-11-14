@@ -4,15 +4,19 @@ import { fetch, ProxyAgent } from 'undici';
 // Initialize SQLite database (persisted on Railway volume or local file)
 const db = new Database('shift_tracker.db');
 
-// Setup database tables for atomic deduplication and notification outbox
+// Setup database tables with telemetry timestamp columns & health tracking
 db.exec(`
   CREATE TABLE IF NOT EXISTS discovered_schedules (
     schedule_id TEXT PRIMARY KEY,
-    discovered_at TEXT
+    discovered_at TEXT,
+    amazon_detected_at TEXT,
+    notification_queued_at TEXT,
+    telegram_sent_at TEXT
   );
 
   CREATE TABLE IF NOT EXISTS telegram_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    schedule_id TEXT,
     message TEXT NOT NULL,
     status TEXT DEFAULT 'pending',
     created_at TEXT
@@ -21,17 +25,21 @@ db.exec(`
 
 // Prepared statements for high performance & atomic safety
 const stmtClaimSchedule = db.prepare(`
-  INSERT OR IGNORE INTO discovered_schedules (schedule_id, discovered_at)
-  VALUES (?, datetime('now'))
+  INSERT OR IGNORE INTO discovered_schedules (schedule_id, discovered_at, amazon_detected_at)
+  VALUES (?, datetime('now'), ?)
+`);
+
+const stmtUpdateQueueTime = db.prepare(`
+  UPDATE discovered_schedules SET notification_queued_at = ? WHERE schedule_id = ?
 `);
 
 const stmtEnqueueTelegram = db.prepare(`
-  INSERT INTO telegram_outbox (message, created_at)
-  VALUES (?, datetime('now'))
+  INSERT INTO telegram_outbox (schedule_id, message, created_at)
+  VALUES (?, ?, datetime('now'))
 `);
 
 const stmtGetPendingAlerts = db.prepare(`
-  SELECT id, message FROM telegram_outbox 
+  SELECT id, schedule_id, message FROM telegram_outbox 
   WHERE status = 'pending' 
   ORDER BY id ASC 
   LIMIT 5
@@ -39,6 +47,15 @@ const stmtGetPendingAlerts = db.prepare(`
 
 const stmtMarkAlertSent = db.prepare(`
   UPDATE telegram_outbox SET status = 'sent' WHERE id = ?
+`);
+
+const stmtUpdateSentTime = db.prepare(`
+  UPDATE discovered_schedules SET telegram_sent_at = datetime('now') WHERE schedule_id = ?
+`);
+
+const stmtGetTelemetryTimestamps = db.prepare(`
+  SELECT amazon_detected_at, notification_queued_at, telegram_sent_at 
+  FROM discovered_schedules WHERE schedule_id = ?
 `);
 
 const stmtMarkAlertFailed = db.prepare(`
@@ -58,7 +75,7 @@ if (PROXY_URL) {
   console.log('[Bot] Configured proxy agent for secure requests.');
 }
 
-// --- ASYNCHRONOUS TELEGRAM WORKER (Prevents HTTP 429 Rate Limits) ---
+// --- ASYNCHRONOUS TELEGRAM WORKER WITH LATENCY TELEMETRY ---
 function startTelegramWorker() {
   setInterval(async () => {
     try {
@@ -84,6 +101,19 @@ function startTelegramWorker() {
 
         if (res.ok) {
           stmtMarkAlertSent.run(alert.id);
+          stmtUpdateSentTime.run(alert.schedule_id);
+
+          // Calculate and log telemetry latency metrics
+          if (alert.schedule_id) {
+            const row = stmtGetTelemetryTimestamps.get(alert.schedule_id);
+            if (row && row.amazon_detected_at && row.notification_queued_at && row.telegram_sent_at) {
+              const tAmazon = new Date(row.amazon_detected_at).getTime();
+              const tQueued = new Date(row.notification_queued_at).getTime();
+              const tSent = new Date(row.telegram_sent_at).getTime();
+              console.log(`[TELEMETRY LATENCY] Schedule ${alert.schedule_id} | Discovery->Queue: ${tQueued - tAmazon}ms | Queue->Telegram: ${tSent - tQueued}ms | Total Pipeline: ${tSent - tAmazon}ms`);
+            }
+          }
+
           console.log('[Telegram] Sent OK');
         } else if (res.status === 429) {
           console.warn('[Telegram] ⚠️ HTTP 429 rate limit hit. Backing off...');
@@ -103,65 +133,82 @@ function startTelegramWorker() {
   }, 1000);
 }
 
-// --- FETCH DETAILED SCHEDULE CARDS FOR A JOB ID ---
+// --- FETCH SCHEDULE CARDS WITH FULL PAGINATION (`nextToken` Crawler) ---
 async function fetchSchedulesForJob(jobId) {
-  const url = 'https://www.jobsatamazon.co.uk/graphql';
-  const query = `
-    query searchScheduleCards($searchScheduleRequest: SearchScheduleRequest!) {
-      searchScheduleCards(searchScheduleRequest: $searchScheduleRequest) {
-        scheduleCards {
-          scheduleId
-          jobId
-          firstDayOnSite
-          firstDayOnSiteL10N
-          scheduleText
-          scheduleType
-          hoursPerWeek
+  let allSchedules = [];
+  let nextToken = null;
+  let pageCount = 0;
+  const maxPages = 5; // Safety limit per job
+
+  do {
+    pageCount++;
+    const url = 'https://www.jobsatamazon.co.uk/graphql';
+    const query = `
+      query searchScheduleCards($searchScheduleRequest: SearchScheduleRequest!) {
+        searchScheduleCards(searchScheduleRequest: $searchScheduleRequest) {
+          nextToken
+          scheduleCards {
+            scheduleId
+            jobId
+            firstDayOnSite
+            firstDayOnSiteL10N
+            scheduleText
+            scheduleType
+            hoursPerWeek
+          }
         }
       }
+    `;
+
+    const variables = {
+      searchScheduleRequest: {
+        country: 'United Kingdom',
+        jobId: jobId,
+        locale: 'en-GB',
+        pageSize: 100,
+        dateFilters: [],
+        rangeFilters: [],
+        equalFilters: [],
+        excludeFilters: [],
+        orFilters: [],
+        ...(nextToken ? { nextToken } : {})
+      }
+    };
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Accept-Language': 'en-GB,en;q=0.9',
+          'Origin': 'https://www.jobsatamazon.co.uk',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          ...(AMAZON_AUTH_TOKEN ? { 'Authorization': AMAZON_AUTH_TOKEN } : {})
+        },
+        body: JSON.stringify({ query, variables }),
+        ...(dispatcher ? { dispatcher } : {})
+      });
+
+      if (!res.ok) break;
+      const data = await res.json();
+      const resultData = data?.data?.searchScheduleCards;
+      if (resultData && resultData.scheduleCards) {
+        allSchedules.push(...resultData.scheduleCards);
+      }
+      nextToken = resultData?.nextToken || null;
+    } catch (err) {
+      break;
     }
-  `;
 
-  const variables = {
-    searchScheduleRequest: {
-      country: 'United Kingdom',
-      jobId: jobId,
-      locale: 'en-GB',
-      pageSize: 100,
-      dateFilters: [],
-      rangeFilters: [],
-      equalFilters: [],
-      excludeFilters: [],
-      orFilters: []
-    }
-  };
+    if (pageCount >= maxPages) break;
+  } while (nextToken);
 
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-GB,en;q=0.9',
-        'Origin': 'https://www.jobsatamazon.co.uk',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        ...(AMAZON_AUTH_TOKEN ? { 'Authorization': AMAZON_AUTH_TOKEN } : {})
-      },
-      body: JSON.stringify({ query, variables }),
-      ...(dispatcher ? { dispatcher } : {})
-    });
-
-    if (!res.ok) return [];
-    const data = await res.json();
-    return data?.data?.searchScheduleCards?.scheduleCards || [];
-  } catch (err) {
-    return [];
-  }
+  return allSchedules;
 }
 
-// --- CORE JOB & SCHEDULE PROCESSOR ---
-async function processDiscoveredJob(job) {
-  // Fetch the real individual shift schedules for this job
+// --- CORE JOB & SCHEDULE PROCESSOR (Atomic Dedup & Timestamps) ---
+async function processDiscoveredJob(job, amazonDetectedAt) {
   const scheduleCards = await fetchSchedulesForJob(job.jobId);
 
   let claimedAny = false;
@@ -169,7 +216,7 @@ async function processDiscoveredJob(job) {
 
   if (scheduleCards && scheduleCards.length > 0) {
     for (const card of scheduleCards) {
-      const res = stmtClaimSchedule.run(card.scheduleId);
+      const res = stmtClaimSchedule.run(card.scheduleId, amazonDetectedAt);
       if (res.changes === 1) {
         claimedAny = true;
       }
@@ -177,20 +224,22 @@ async function processDiscoveredJob(job) {
     }
   } else {
     // Fallback if schedule endpoint returns empty
-    const res = stmtClaimSchedule.run(job.jobId);
+    const fallbackId = `${job.jobId}-fallback`;
+    const res = stmtClaimSchedule.run(fallbackId, amazonDetectedAt);
     if (res.changes === 1) {
       claimedAny = true;
     }
     validSchedules.push({
-      scheduleId: job.jobId,
+      scheduleId: fallbackId,
       firstDayOnSiteL10N: 'Upcoming',
       scheduleText: 'Working Days Flexible',
       hoursPerWeek: '20'
     });
   }
 
-  // If at least one schedule was newly claimed (atomic deduplication passed)
+  // If at least one schedule was newly claimed (Atomic deduplication passed)
   if (claimedAny) {
+    const queuedAt = new Date().toISOString();
     const locationName = job.locationName || job.city || 'UK Delivery Station';
     const postalCode = job.postalCode || '';
     const title = job.jobTitle || 'Delivery Station Warehouse Associate';
@@ -209,73 +258,104 @@ async function processDiscoveredJob(job) {
                  `🕐 Hours/Week: ${shift.hoursPerWeek || '20'}\n`;
     });
 
-    stmtEnqueueTelegram.run(message);
-    console.log(`[DEDUP] Claimed and queued alert for job: ${job.jobId} (${locationName}) with ${shiftCount} shift(s)`);
+    for (const shift of validSchedules) {
+      stmtUpdateQueueTime.run(queuedAt, shift.scheduleId);
+      stmtEnqueueTelegram.run(shift.scheduleId, message, queuedAt);
+    }
+
+    console.log(`[DEDUP] Claimed and queued alert for job: ${job.jobId} (${locationName}) with ${shiftCount} shift(s) at ${queuedAt}`);
   }
 }
 
-// --- AMAZON GRAPHQL FEED FETCHER ---
+// --- FULL NATIONWIDE FEED FETCHER WITH PAGINATION & SCAN HEALTH TRACKING ---
 async function fetchAmazonJobFeed() {
-  const url = 'https://www.jobsatamazon.co.uk/graphql';
-  const query = `
-    query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
-      searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
-        nextToken
-        jobCards {
-          jobId
-          jobTitle
-          city
-          postalCode
-          locationName
-          scheduleCount
-          totalPayRateMax
+  let allJobCards = [];
+  let nextToken = null;
+  let pageCount = 0;
+  let scanStatus = 'COMPLETE'; // COMPLETE | PARTIAL | BLOCKED
+  const maxPages = 10; // Safeguard limit for feed pagination
+
+  do {
+    pageCount++;
+    const url = 'https://www.jobsatamazon.co.uk/graphql';
+    const query = `
+      query searchJobCardsByLocation($searchJobRequest: SearchJobRequest!) {
+        searchJobCardsByLocation(searchJobRequest: $searchJobRequest) {
+          nextToken
+          jobCards {
+            jobId
+            jobTitle
+            city
+            postalCode
+            locationName
+            scheduleCount
+            totalPayRateMax
+          }
         }
       }
+    `;
+
+    const variables = {
+      searchJobRequest: {
+        locale: 'en-GB',
+        country: 'United Kingdom',
+        keyWords: '',
+        equalFilters: [],
+        containFilters: [{ key: 'isPrivateSchedule', val: ['true', 'false'] }],
+        rangeFilters: [],
+        orFilters: [],
+        dateFilters: [],
+        sorters: [{ fieldName: 'totalPayRateMax', ascending: 'false' }],
+        pageSize: 100,
+        consolidateSchedule: true,
+        ...(nextToken ? { nextToken } : {})
+      }
+    };
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Accept-Language': 'en-GB,en;q=0.9',
+          'Origin': 'https://www.jobsatamazon.co.uk',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          ...(AMAZON_AUTH_TOKEN ? { 'Authorization': AMAZON_AUTH_TOKEN } : {})
+        },
+        body: JSON.stringify({ query, variables }),
+        ...(dispatcher ? { dispatcher } : {})
+      });
+
+      if (res.status === 403) {
+        console.warn('[Scan Health] 🛑 BLOCKED: Amazon HTTP 403 WAF challenge encountered.');
+        scanStatus = 'BLOCKED';
+        break;
+      }
+
+      if (!res.ok) {
+        console.warn(`[Scan Health] ⚠️ PARTIAL: HTTP ${res.status} response on page ${pageCount}.`);
+        scanStatus = 'PARTIAL';
+        break;
+      }
+
+      const data = await res.json();
+      const resultData = data?.data?.searchJobCardsByLocation;
+      if (resultData && resultData.jobCards) {
+        allJobCards.push(...resultData.jobCards);
+      }
+
+      nextToken = resultData?.nextToken || null;
+    } catch (err) {
+      console.error(`[Scan Health] ⚠️ PARTIAL/FAILED: Exception on page ${pageCount}:`, err.message);
+      scanStatus = 'PARTIAL';
+      break;
     }
-  `;
 
-  const variables = {
-    searchJobRequest: {
-      locale: 'en-GB',
-      country: 'United Kingdom',
-      keyWords: '',
-      equalFilters: [],
-      containFilters: [{ key: 'isPrivateSchedule', val: ['true', 'false'] }],
-      rangeFilters: [],
-      orFilters: [],
-      dateFilters: [],
-      sorters: [{ fieldName: 'totalPayRateMax', ascending: 'false' }],
-      pageSize: 100,
-      consolidateSchedule: true
-    }
-  };
+    if (pageCount >= maxPages) break;
+  } while (nextToken);
 
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-GB,en;q=0.9',
-        'Origin': 'https://www.jobsatamazon.co.uk',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        ...(AMAZON_AUTH_TOKEN ? { 'Authorization': AMAZON_AUTH_TOKEN } : {})
-      },
-      body: JSON.stringify({ query, variables }),
-      ...(dispatcher ? { dispatcher } : {})
-    });
-
-    if (!res.ok) {
-      console.warn(`[Amazon API] HTTP ${res.status} response received.`);
-      return [];
-    }
-
-    const data = await res.json();
-    return data?.data?.searchJobCardsByLocation?.jobCards || [];
-  } catch (err) {
-    console.error('[Amazon API] Fetch exception:', err.message);
-    return [];
-  }
+  return { jobCards: allJobCards, scanStatus };
 }
 
 // --- ORGANIC REQUEST JITTER (3-5 seconds) ---
@@ -290,13 +370,14 @@ async function runScannerLoop(loopName) {
 
   while (true) {
     try {
-      const jobCards = await fetchAmazonJobFeed();
+      const amazonDetectedAt = new Date().toISOString();
+      const { jobCards, scanStatus } = await fetchAmazonJobFeed();
       
-      if (jobCards && jobCards.length > 0) {
-        console.log(`[${loopName}] Fetched ${jobCards.length} job card(s) from Amazon.`);
+      console.log(`[Scan Health] [${loopName}] Scan completed with status: [${scanStatus}] | Retrieved ${jobCards.length} job card(s).`);
+
+      if (scanStatus !== 'BLOCKED' && jobCards && jobCards.length > 0) {
         for (const job of jobCards) {
-          // Process each job and fetch its detailed schedules
-          await processDiscoveredJob(job);
+          await processDiscoveredJob(job, amazonDetectedAt);
         }
       }
 
@@ -309,9 +390,9 @@ async function runScannerLoop(loopName) {
 }
 
 // --- APP INITIALIZATION ---
-console.log('[Bot] Starting Amazon Shift Tracker (Node.js High-Speed Edition)...');
-console.log('[Activation] Runtime: Node.js ES Modules | Database: better-sqlite3 | Deduplication: Atomic SQLite Lock');
-console.log('[Bot] Targets: Nationwide UK Feed Scans with Full Schedule Card Resolution');
+console.log('[Bot] Starting Amazon Shift Tracker (Production Telemetry & Pagination Edition)...');
+console.log('[Activation] Runtime: Node.js ES Modules | Database: better-sqlite3 | Pagination: Active nextToken Crawler');
+console.log('[Bot] Targets: Nationwide UK Feed Scans with Scan Health Tracking & Latency Telemetry');
 console.log('[Watchdog] Started - monitoring 3 global overlapping loops with staggered delays.');
 
 startTelegramWorker();
