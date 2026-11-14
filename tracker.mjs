@@ -266,6 +266,55 @@ function startTelegramWorker() {
   return setInterval(runTelegramWorkerCycle, 1000);
 }
 
+function safeAmazonDiagnosticText(value) {
+  return String(value ?? 'Unknown Amazon error')
+    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(authorization|token|password|cookie|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED]')
+    .replace(/https?:\/\/[^\s/@:]+:[^\s/@]+@/gi, '[REDACTED_URL]')
+    .replace(/[\r\n]+/g, ' ')
+    .slice(0, 240);
+}
+
+function summarizeGraphQLErrors(errors) {
+  const messages = errors.slice(0, 3).map((error) => (
+    safeAmazonDiagnosticText(error?.message ?? 'Unspecified GraphQL error')
+  ));
+  const omittedCount = errors.length - messages.length;
+  const omitted = omittedCount > 0 ? `; ${omittedCount} more` : '';
+  return `${errors.length} error(s): ${messages.join('; ')}${omitted}`;
+}
+
+function reportAmazonGraphQLErrors(operation, errors, pageCount, jobId) {
+  if (!Array.isArray(errors) || errors.length === 0) return;
+  const jobLabel = jobId ? ` for job ${safeAmazonDiagnosticText(jobId)}` : '';
+  console.warn(
+    `[Scan Health] PARTIAL: Amazon GraphQL ${operation} errors on page ${pageCount}`
+    + `${jobLabel}: ${summarizeGraphQLErrors(errors)}`,
+  );
+}
+
+function retryAfterLogSuffix(response) {
+  const value = response?.headers?.get?.('retry-after');
+  if (typeof value !== 'string' || value.trim() === '') return '';
+  return ` Retry-After=${safeAmazonDiagnosticText(value.trim()).slice(0, 80)}`;
+}
+
+function reportAmazonHttpFailure(operation, response, pageCount, jobId) {
+  const jobLabel = jobId ? ` for job ${safeAmazonDiagnosticText(jobId)}` : '';
+  const context = `${operation} page ${pageCount}${jobLabel}`;
+  const retryAfter = retryAfterLogSuffix(response);
+
+  if (response.status === 403) {
+    console.warn(`[Scan Health] BLOCKED: Amazon HTTP 403 on ${context}.`);
+  } else if (response.status === 429) {
+    console.warn(`[Scan Health] THROTTLED: Amazon HTTP 429 on ${context}.${retryAfter}`);
+  } else {
+    console.warn(
+      `[Scan Health] PARTIAL: Amazon HTTP ${response.status} on ${context}.${retryAfter}`,
+    );
+  }
+}
+
 // --- FETCH SCHEDULE CARDS WITH FULL PAGINATION (`nextToken` Crawler) ---
 async function fetchSchedulesForJob(jobId) {
   let allSchedules = [];
@@ -325,6 +374,7 @@ async function fetchSchedulesForJob(jobId) {
       });
 
       if (!res.ok) {
+        reportAmazonHttpFailure('schedule feed', res, pageCount, jobId);
         paginationComplete = false;
         break;
       }
@@ -334,7 +384,16 @@ async function fetchSchedulesForJob(jobId) {
         allSchedules.push(...resultData.scheduleCards);
       }
       nextToken = resultData?.nextToken || null;
+      if (Array.isArray(data?.errors) && data.errors.length > 0) {
+        reportAmazonGraphQLErrors('schedule feed', data.errors, pageCount, jobId);
+        paginationComplete = false;
+        break;
+      }
     } catch (err) {
+      console.error(
+        `[Scan Health] PARTIAL/FAILED: Amazon schedule feed exception on page ${pageCount}`
+        + ` for job ${safeAmazonDiagnosticText(jobId)}: ${safeAmazonDiagnosticText(err?.message)}`,
+      );
       paginationComplete = false;
       break;
     }
@@ -463,13 +522,13 @@ async function fetchAmazonJobFeed() {
       });
 
       if (res.status === 403) {
-        console.warn('[Scan Health] 🛑 BLOCKED: Amazon HTTP 403 WAF challenge encountered.');
+        reportAmazonHttpFailure('job feed', res, pageCount);
         scanStatus = 'BLOCKED';
         break;
       }
 
       if (!res.ok) {
-        console.warn(`[Scan Health] ⚠️ PARTIAL: HTTP ${res.status} response on page ${pageCount}.`);
+        reportAmazonHttpFailure('job feed', res, pageCount);
         scanStatus = 'PARTIAL';
         break;
       }
@@ -486,8 +545,15 @@ async function fetchAmazonJobFeed() {
       }
 
       nextToken = resultData?.nextToken || null;
+      if (Array.isArray(data?.errors) && data.errors.length > 0) {
+        reportAmazonGraphQLErrors('job feed', data.errors, pageCount);
+        scanStatus = 'PARTIAL';
+      }
     } catch (err) {
-      console.error(`[Scan Health] ⚠️ PARTIAL/FAILED: Exception on page ${pageCount}:`, err.message);
+      console.error(
+        `[Scan Health] PARTIAL/FAILED: Amazon job feed exception on page ${pageCount}:`
+        + ` ${safeAmazonDiagnosticText(err?.message)}`,
+      );
       scanStatus = 'PARTIAL';
       break;
     }

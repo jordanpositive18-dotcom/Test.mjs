@@ -6,10 +6,17 @@ import vm from 'node:vm';
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'node:url';
 
-export function mockResponse(payload, status = 200) {
+export function mockResponse(payload, status = 200, responseHeaders = {}) {
   return {
     ok: status >= 200 && status < 300,
     status,
+    headers: {
+      get(name) {
+        const key = Object.keys(responseHeaders)
+          .find((headerName) => headerName.toLowerCase() === name.toLowerCase());
+        return key ? String(responseHeaders[key]) : null;
+      },
+    },
     async json() {
       return payload;
     },

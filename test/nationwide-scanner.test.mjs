@@ -60,6 +60,64 @@ test('job feed preserves Amazon request URL, query, variables and headers', asyn
   });
 });
 
+test('HTTP-success job responses with GraphQL errors are logged and marked PARTIAL', async (t) => {
+  const logs = [];
+  const harness = createScannerHarness(t, {
+    jobResponder: async () => mockResponse({
+      errors: [{ message: 'Invalid SearchJobRequest; authorization=mock-secret' }],
+      data: {
+        searchJobCardsByLocation: {
+          jobCards: [jobSource],
+          nextToken: null,
+        },
+      },
+    }),
+    logger: {
+      log() {},
+      warn: (...values) => logs.push(values.join(' ')),
+      error: (...values) => logs.push(values.join(' ')),
+    },
+  });
+
+  const result = await harness.api.fetchAmazonJobFeed();
+  assert.equal(result.scanStatus, 'PARTIAL');
+  assert.equal(result.jobCards.length, 1);
+  assert.ok(logs.some((line) => line.includes('Amazon GraphQL job feed errors')));
+  assert.ok(logs.some((line) => line.includes('Invalid SearchJobRequest')));
+  assert.doesNotMatch(logs.join('\n'), /mock-secret/);
+  assert.deepEqual(harness.delays, []);
+});
+
+test('job-feed HTTP 403 and 429 responses are logged with status details', async (t) => {
+  const logs = [];
+  const logger = {
+    log() {},
+    warn: (...values) => logs.push(values.join(' ')),
+    error: (...values) => logs.push(values.join(' ')),
+  };
+  const blockedHarness = createScannerHarness(t, {
+    jobResponder: async () => mockResponse({}, 403),
+    logger,
+  });
+  const blocked = await blockedHarness.api.fetchAmazonJobFeed();
+  assert.equal(blocked.scanStatus, 'BLOCKED');
+  assert.ok(logs.some((line) => line.includes('BLOCKED: Amazon HTTP 403 on job feed page 1')));
+  assert.deepEqual(blockedHarness.delays, []);
+
+  logs.length = 0;
+  const throttledHarness = createScannerHarness(t, {
+    jobResponder: async () => mockResponse({}, 429, { 'Retry-After': '45' }),
+    logger,
+  });
+  const throttled = await throttledHarness.api.fetchAmazonJobFeed();
+  assert.equal(throttled.scanStatus, 'PARTIAL');
+  assert.ok(logs.some((line) => (
+    line.includes('THROTTLED: Amazon HTTP 429 on job feed page 1')
+    && line.includes('Retry-After=45')
+  )));
+  assert.deepEqual(throttledHarness.delays, []);
+});
+
 test('job pagination with an unconsumed nextToken is reported PARTIAL at the page limit', async (t) => {
   const harness = createScannerHarness(t, {
     jobResponder: async (_call, page) => mockResponse({
@@ -101,6 +159,63 @@ test('schedule pagination with an unconsumed nextToken is reported incomplete', 
     harness.amazonCalls.map(({ body }) => body.variables.searchScheduleRequest.nextToken ?? null),
     [null, 'schedule-page-2', 'schedule-page-3', 'schedule-page-4', 'schedule-page-5'],
   );
+});
+
+test('HTTP-success schedule responses with GraphQL errors are logged and incomplete', async (t) => {
+  const logs = [];
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      errors: [{ message: 'Schedule selection failed; token=mock-secret' }],
+      data: {
+        searchScheduleCards: {
+          scheduleCards: [{ scheduleId: 'S-PARTIAL', jobId: jobSource.jobId }],
+          nextToken: null,
+        },
+      },
+    }),
+    logger: {
+      log() {},
+      warn: (...values) => logs.push(values.join(' ')),
+      error: (...values) => logs.push(values.join(' ')),
+    },
+  });
+
+  const result = await harness.api.fetchSchedulesForJob(jobSource.jobId);
+  assert.equal(result.paginationComplete, false);
+  assert.equal(result.schedules.length, 1);
+  assert.ok(logs.some((line) => line.includes('Amazon GraphQL schedule feed errors')));
+  assert.ok(logs.some((line) => line.includes('Schedule selection failed')));
+  assert.doesNotMatch(logs.join('\n'), /mock-secret/);
+});
+
+test('schedule HTTP 403 and 429 responses are logged with status details', async (t) => {
+  const logs = [];
+  const logger = {
+    log() {},
+    warn: (...values) => logs.push(values.join(' ')),
+    error: (...values) => logs.push(values.join(' ')),
+  };
+  const blockedHarness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({}, 403),
+    logger,
+  });
+  const blocked = await blockedHarness.api.fetchSchedulesForJob(jobSource.jobId);
+  assert.equal(blocked.paginationComplete, false);
+  assert.ok(logs.some((line) => (
+    line.includes(`BLOCKED: Amazon HTTP 403 on schedule feed page 1 for job ${jobSource.jobId}`)
+  )));
+
+  logs.length = 0;
+  const throttledHarness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({}, 429, { 'retry-after': '30' }),
+    logger,
+  });
+  const throttled = await throttledHarness.api.fetchSchedulesForJob(jobSource.jobId);
+  assert.equal(throttled.paginationComplete, false);
+  assert.ok(logs.some((line) => (
+    line.includes(`THROTTLED: Amazon HTTP 429 on schedule feed page 1 for job ${jobSource.jobId}`)
+    && line.includes('Retry-After=30')
+  )));
 });
 
 test('an incomplete schedule scan cannot be reported as COMPLETE', async (t) => {
