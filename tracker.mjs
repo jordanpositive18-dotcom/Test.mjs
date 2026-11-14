@@ -21,6 +21,13 @@ db.exec(`
     status TEXT DEFAULT 'pending',
     created_at TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS amazon_request_protection (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
 `);
 
 // Normalize legacy SQLite UTC timestamps to ISO 8601 without changing records.
@@ -149,6 +156,21 @@ const stmtGetTelemetryTimestamps = db.prepare(`
   FROM discovered_schedules WHERE schedule_id = ?
 `);
 
+const stmtGetAmazonProtection = db.prepare(`
+  SELECT reason, expires_at
+  FROM amazon_request_protection
+  WHERE id = 1
+`);
+
+const stmtSetAmazonProtection = db.prepare(`
+  INSERT INTO amazon_request_protection (id, reason, expires_at, updated_at)
+  VALUES (1, ?, ?, ?)
+  ON CONFLICT(id) DO UPDATE SET
+    reason = excluded.reason,
+    expires_at = excluded.expires_at,
+    updated_at = excluded.updated_at
+`);
+
 // Configuration from environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -170,6 +192,210 @@ let telegramWorkerRunning = false;
 const TELEGRAM_MAX_ATTEMPTS = 3;
 const TELEGRAM_RETRY_BASE_MS = 5000;
 const TELEGRAM_RETRY_MAX_MS = 60000;
+const AMAZON_REQUEST_TIMEOUT_MS = 30000;
+const AMAZON_403_COOLDOWN_MS = 15 * 60 * 1000;
+const AMAZON_429_FALLBACK_COOLDOWN_MS = 60 * 1000;
+const AMAZON_TRANSIENT_COOLDOWN_MS = 30 * 1000;
+const AMAZON_AUTH_COOLDOWN_MS = 15 * 60 * 1000;
+const activeAmazonControllers = new Set();
+let pendingProtectionWrite = null;
+
+function getAmazonProtectionState() {
+  if (pendingProtectionWrite) {
+    try {
+      stmtSetAmazonProtection.run(
+        pendingProtectionWrite.reason,
+        pendingProtectionWrite.expiresAt,
+        new Date().toISOString(),
+      );
+      pendingProtectionWrite = null;
+    } catch {
+      return {
+        blocked: true,
+        reason: 'protection_state_unavailable',
+        expiresAt: null,
+      };
+    }
+  }
+
+  try {
+    const state = stmtGetAmazonProtection.get();
+    if (!state) return { blocked: false, reason: null, expiresAt: null };
+    const expiresAtMs = Date.parse(state.expires_at);
+    if (!Number.isFinite(expiresAtMs)) {
+      return {
+        blocked: true,
+        reason: 'protection_state_invalid',
+        expiresAt: state.expires_at,
+      };
+    }
+    if (expiresAtMs > Date.now()) {
+      return { blocked: true, reason: state.reason, expiresAt: state.expires_at };
+    }
+    return { blocked: false, reason: null, expiresAt: state.expires_at };
+  } catch {
+    return {
+      blocked: true,
+      reason: 'protection_state_unavailable',
+      expiresAt: null,
+    };
+  }
+}
+
+function abortOtherAmazonRequests(exceptController, reason) {
+  for (const controller of activeAmazonControllers) {
+    if (controller !== exceptController) {
+      controller.abort({ type: 'amazon-shared-cooldown', reason });
+    }
+  }
+}
+
+function activateAmazonCooldown(reason, durationMs, loopName, operation, controller, status = 'none') {
+  const now = Date.now();
+  let expiresAtMs = now + durationMs;
+  try {
+    const existing = stmtGetAmazonProtection.get();
+    const existingExpiry = Date.parse(existing?.expires_at ?? '');
+    if (Number.isFinite(existingExpiry) && existingExpiry > expiresAtMs) {
+      expiresAtMs = existingExpiry;
+    }
+  } catch {
+    // Still attempt to persist the new cooldown; a failed read never permits a request.
+  }
+
+  const expiresAt = new Date(expiresAtMs).toISOString();
+  try {
+    stmtSetAmazonProtection.run(reason, expiresAt, new Date(now).toISOString());
+  } catch {
+    // Keep the process fail-closed and retry persistence before any later request.
+    pendingProtectionWrite = { reason, expiresAt };
+  }
+  abortOtherAmazonRequests(controller, reason);
+  console.warn(
+    `[AmazonRequest] loop=${loopName} operation=${operation} status=${status} `
+    + `cooldownReason=${reason} cooldownExpiresAt=${expiresAt}`,
+  );
+  return expiresAt;
+}
+
+function parseRetryAfterMs(response, now = Date.now()) {
+  const value = response?.headers?.get?.('retry-after');
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const trimmed = value.trim();
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    return Math.max(0, Math.ceil(Number(trimmed) * 1000));
+  }
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isFinite(dateMs)) return null;
+  return Math.max(0, dateMs - now);
+}
+
+function amazonFailureCooldown(response) {
+  if (response.status === 403) {
+    return { reason: 'http_403', durationMs: AMAZON_403_COOLDOWN_MS };
+  }
+  if (response.status === 429) {
+    return {
+      reason: 'http_429',
+      durationMs: parseRetryAfterMs(response) ?? AMAZON_429_FALLBACK_COOLDOWN_MS,
+    };
+  }
+  if (response.status === 401) {
+    return { reason: 'http_401_authentication', durationMs: AMAZON_AUTH_COOLDOWN_MS };
+  }
+  if (response.status >= 500) {
+    return { reason: `http_${response.status}`, durationMs: AMAZON_TRANSIENT_COOLDOWN_MS };
+  }
+  return null;
+}
+
+async function protectedAmazonFetch(operation, loopName, url, options) {
+  const before = getAmazonProtectionState();
+  if (before.blocked) {
+    console.warn(
+      `[AmazonRequest] loop=${loopName} operation=${operation} status=none durationMs=0 `
+      + `cooldownReason=${before.reason} cooldownExpiresAt=${before.expiresAt ?? 'unknown'} `
+      + `scan=BLOCKED`,
+    );
+    return null;
+  }
+
+  const controller = new AbortController();
+  activeAmazonControllers.add(controller);
+  const startedAt = Date.now();
+  let timeoutHandle;
+  let status = 'none';
+  try {
+    const response = await Promise.race([
+      fetch(url, { ...options, signal: controller.signal }),
+      new Promise((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          controller.abort({ type: 'amazon-timeout' });
+          const error = new Error('Amazon request timed out');
+          error.name = 'TimeoutError';
+          reject(error);
+        }, AMAZON_REQUEST_TIMEOUT_MS);
+      }),
+    ]);
+    status = response.status;
+    const cooldown = !response.ok ? amazonFailureCooldown(response) : null;
+    if (cooldown) {
+      const expiry = activateAmazonCooldown(
+        cooldown.reason,
+        cooldown.durationMs,
+        loopName,
+        operation,
+        controller,
+        response.status,
+      );
+      try {
+        await response.body?.cancel?.();
+      } catch {
+        // Closing an already-aborted or empty error body must not disable cooldown protection.
+      }
+      console.warn(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=${response.status} `
+        + `durationMs=${Date.now() - startedAt} cooldownExpiresAt=${expiry} scan=BLOCKED`,
+      );
+    } else {
+      console.log(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=${response.status} `
+        + `durationMs=${Date.now() - startedAt} scan=${response.ok ? 'REQUEST_OK' : 'PARTIAL'}`,
+      );
+    }
+    return response;
+  } catch (error) {
+    if (controller.signal.reason?.type === 'amazon-shared-cooldown') {
+      const state = getAmazonProtectionState();
+      console.warn(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=aborted `
+        + `durationMs=${Date.now() - startedAt} cooldownReason=${state.reason ?? 'shared_cooldown'} `
+        + `cooldownExpiresAt=${state.expiresAt ?? 'unknown'} scan=BLOCKED`,
+      );
+      return null;
+    }
+
+    const timedOut = controller.signal.reason?.type === 'amazon-timeout';
+    const reason = timedOut ? 'request_timeout' : 'network_error';
+    const expiry = activateAmazonCooldown(
+      reason,
+      AMAZON_TRANSIENT_COOLDOWN_MS,
+      loopName,
+      operation,
+      controller,
+      status,
+    );
+    console.error(
+      `[AmazonRequest] loop=${loopName} operation=${operation} status=${status} `
+      + `errorCategory=${reason} durationMs=${Date.now() - startedAt} `
+      + `cooldownExpiresAt=${expiry} scan=PARTIAL`,
+    );
+    throw error;
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    activeAmazonControllers.delete(controller);
+  }
+}
 
 function recordTelegramFailure(alert, error) {
   const attemptCount = alert.attempt_count;
@@ -310,6 +536,8 @@ function reportAmazonHttpFailure(operation, response, pageCount, jobId) {
 
   if (response.status === 403) {
     console.warn(`[Scan Health] BLOCKED: Amazon HTTP 403 on ${context}.`);
+  } else if (response.status === 401) {
+    console.warn(`[Scan Health] BLOCKED: Amazon HTTP 401 authentication failure on ${context}.`);
   } else if (response.status === 429) {
     console.warn(`[Scan Health] THROTTLED: Amazon HTTP 429 on ${context}.${retryAfter}`);
   } else {
@@ -320,7 +548,7 @@ function reportAmazonHttpFailure(operation, response, pageCount, jobId) {
 }
 
 // --- FETCH SCHEDULE CARDS WITH FULL PAGINATION (`nextToken` Crawler) ---
-async function fetchSchedulesForJob(jobId) {
+async function fetchSchedulesForJob(jobId, loopName = 'Loop-unknown') {
   let allSchedules = [];
   let nextToken = null;
   let pageCount = 0;
@@ -363,7 +591,7 @@ async function fetchSchedulesForJob(jobId) {
     };
 
     try {
-      const res = await fetch(url, {
+      const res = await protectedAmazonFetch('searchScheduleCards', loopName, url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -376,6 +604,11 @@ async function fetchSchedulesForJob(jobId) {
         body: JSON.stringify({ query, variables }),
         ...(dispatcher ? { dispatcher } : {})
       });
+
+      if (!res) {
+        paginationComplete = false;
+        break;
+      }
 
       if (!res.ok) {
         reportAmazonHttpFailure('schedule feed', res, pageCount, jobId);
@@ -412,8 +645,8 @@ async function fetchSchedulesForJob(jobId) {
 }
 
 // --- CORE JOB & SCHEDULE PROCESSOR ---
-async function processDiscoveredJob(job, amazonDetectedAt) {
-  const { schedules: scheduleCards, paginationComplete } = await fetchSchedulesForJob(job.jobId);
+async function processDiscoveredJob(job, amazonDetectedAt, loopName = 'Loop-unknown') {
+  const { schedules: scheduleCards, paginationComplete } = await fetchSchedulesForJob(job.jobId, loopName);
   const queued = db.transaction(() => {
     const newlyDiscovered = [];
     for (const card of scheduleCards) {
@@ -466,7 +699,7 @@ async function processDiscoveredJob(job, amazonDetectedAt) {
 }
 
 // --- FULL NATIONWIDE FEED FETCHER WITH PAGINATION & SCAN HEALTH TRACKING ---
-async function fetchAmazonJobFeed() {
+async function fetchAmazonJobFeed(loopName = 'Loop-unknown') {
   let allJobCards = [];
   let nextToken = null;
   let pageCount = 0;
@@ -511,7 +744,7 @@ async function fetchAmazonJobFeed() {
     };
 
     try {
-      const res = await fetch(url, {
+      const res = await protectedAmazonFetch('searchJobCardsByLocation', loopName, url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -525,7 +758,12 @@ async function fetchAmazonJobFeed() {
         ...(dispatcher ? { dispatcher } : {})
       });
 
-      if (res.status === 403) {
+      if (!res) {
+        scanStatus = 'BLOCKED';
+        break;
+      }
+
+      if (res.status === 403 || res.status === 401) {
         reportAmazonHttpFailure('job feed', res, pageCount);
         scanStatus = 'BLOCKED';
         break;
@@ -583,12 +821,12 @@ async function runScannerLoop(loopName) {
 
   while (true) {
     try {
-      const { jobCards, scanStatus } = await fetchAmazonJobFeed();
+      const { jobCards, scanStatus } = await fetchAmazonJobFeed(loopName);
       let completedScanStatus = scanStatus;
 
       if (scanStatus !== 'BLOCKED' && jobCards && jobCards.length > 0) {
         for (const job of jobCards) {
-          const result = await processDiscoveredJob(job, job._scannerDetectedAt);
+          const result = await processDiscoveredJob(job, job._scannerDetectedAt, loopName);
           completedScanStatus = includeSchedulePaginationStatus(
             completedScanStatus,
             result.paginationComplete,
