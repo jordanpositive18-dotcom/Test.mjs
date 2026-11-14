@@ -1,0 +1,30 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "7g7jbKAeNMrGahtm6FCDz"
+uri = "file://amazon_shift_finder_review.zip"
+type = "unspecified"
+title = "Amazon Shift Finder review ZIP"
+description = "Current project files plus the most recent full scanner implementation available in local Git history. See REVIEW_EXPORT_NOTES.txt for the current-source discrepancy."
+logical_id = "2d710081-3d35-44e6-924d-433fd904ec5a"
+content_hash = "sha256:3089f6cfed3c52be0fefa80932566a3720deafc0b11af733dc3fd4c3310e075e"
+size = 24123
+mtime_ms = 1794655432132
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:7d5d5ecc-fde2-4e63-8a5f-8f14f116364a/2d710081-3d35-44e6-924d-433fd904ec5a/a5646758-7336-4ef5-ac01-b8258e0d38fd"
+storage_version_token = "1794655551162017"
+content_type = "application/octet-stream"
+
+[[outputs]]
+id = "Cd8HYRQ1Z7uMcdNlg-IVC"
+uri = "file://amazon_shift_finder_repaired_review.zip"
+type = "unspecified"
+title = "Amazon Shift Finder repaired review ZIP"
+description = "Includes the repaired scanner, tests, package files, safe Replit config, test results, and the complete diff against the restored original."
+logical_id = "c66deb3f-42e4-404e-b91d-b447ebdf5cb6"
+content_hash = "sha256:713125ef4fa5c42631383bff281bdabbb7dc60f5a1f2e4ec593ff26af8d595ce"
+size = 64154
+mtime_ms = 1794659334891
+storage_uri = "gcs://replit-rams-assets-janeway/rams/assets/repl:7d5d5ecc-fde2-4e63-8a5f-8f14f116364a/c66deb3f-42e4-404e-b91d-b447ebdf5cb6/a891b68f-7d97-4cac-af4e-e13541375479"
+storage_version_token = "1794659350426784"
+content_type = "application/octet-stream"

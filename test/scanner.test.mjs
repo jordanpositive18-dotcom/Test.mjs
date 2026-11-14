@@ -1,501 +1,261 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import Database from 'better-sqlite3';
 import test from 'node:test';
-import { createScanner } from '../tracker.mjs';
+import { countRows, createScannerHarness, mockResponse } from './scanner-harness.mjs';
 
-const BASE_TIME = Date.parse('2026-11-13T12:00:00.000Z');
-const DEFAULT_SCHEDULE = {
-  scheduleId: 'SHIFT-1',
-  hireStartDate: '2026-12-01',
-  basePay: '17.25',
+const job = {
+  jobId: 'JOB-1',
+  jobTitle: 'Warehouse Associate',
+  locationName: 'London Delivery Station',
+  postalCode: 'E1 6AN',
+  totalPayRateMax: 17.25,
+};
+
+const schedule = (scheduleId, scheduleText) => ({
+  scheduleId,
+  jobId: job.jobId,
+  firstDayOnSiteL10N: '1 December 2026',
+  scheduleText,
   hoursPerWeek: '30',
-  workingDays: 'Monday-Friday',
-  startTime: '07:00',
-  finishTime: '15:30',
-  location: 'London Warehouse',
-  postcode: 'E1 6AN',
-};
-const QUIET_LOGGER = {
-  log() {},
-  warn() {},
-  error() {},
-};
+});
 
-function response(body, status = 200, headers = {}) {
-  return {
-    status,
-    ok: status >= 200 && status < 300,
-    headers: {
-      get(name) {
-        return headers[name.toLowerCase()] ?? null;
+test('only newly inserted schedule IDs enter one grouped Telegram alert', async (t) => {
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      data: {
+        searchScheduleCards: {
+          scheduleCards: [schedule('S-OLD', 'Existing shift'), schedule('S-NEW', 'New shift')],
+          nextToken: null,
+        },
       },
-    },
-    async json() {
-      return body;
-    },
-    async text() {
-      return JSON.stringify(body);
-    },
-  };
-}
-
-function createContext(t, { initialTime = BASE_TIME } = {}) {
-  const directory = mkdtempSync(join(tmpdir(), 'amazon-shift-finder-test-'));
-  const databasePath = join(directory, 'test.sqlite');
-  const closeCallbacks = [];
-  let currentTime = initialTime;
-
-  t.after(() => {
-    for (const close of closeCallbacks) close();
-    rmSync(directory, { recursive: true, force: true });
+    }),
   });
+  const { db } = harness.api;
+  db.prepare(`
+    INSERT INTO discovered_schedules (schedule_id, discovered_at, amazon_detected_at)
+    VALUES (?, datetime('now'), ?)
+  `).run('S-OLD', new Date().toISOString());
 
-  return {
-    databasePath,
-    getTime: () => currentTime,
-    setTime: (nextTime) => {
-      currentTime = nextTime;
-    },
-    createFixture({
-      amazonResponder = async () => response({
-        data: { searchScheduleCards: [DEFAULT_SCHEDULE] },
-      }),
-      jobSearchResponder = async (_url, _options, scanner) => response({
-        data: {
-          searchJobCardsByLocation: {
-            jobCards: scanner.db.prepare('SELECT job_id FROM job_queue').all()
-              .map(({ job_id }) => ({ jobId: job_id })),
-            nextToken: null,
-          },
+  const first = await harness.api.processDiscoveredJob(job, new Date().toISOString());
+  const second = await harness.api.processDiscoveredJob(job, new Date().toISOString());
+
+  assert.equal(first.count, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(first.scheduleIds)), ['S-NEW']);
+  assert.equal(second.count, 0);
+  assert.equal(countRows(db, 'discovered_schedules'), 2);
+  assert.equal(countRows(db, 'telegram_outbox'), 1);
+  const legacyKey = db.prepare('SELECT notification_key FROM telegram_outbox').get().notification_key;
+  const duplicate = db.prepare(`
+    INSERT OR IGNORE INTO telegram_outbox
+      (schedule_id, notification_key, schedule_ids, message, status, created_at)
+    VALUES ('S-NEW', ?, '["S-NEW"]', 'duplicate alert', 'pending', datetime('now'))
+  `).run(legacyKey);
+  assert.equal(duplicate.changes, 0);
+
+  const alert = db.prepare('SELECT * FROM telegram_outbox').get();
+  assert.deepEqual(JSON.parse(alert.schedule_ids), ['S-NEW']);
+  assert.match(alert.message, /New shift/);
+  assert.doesNotMatch(alert.message, /Existing shift/);
+  assert.equal((alert.message.match(/📋 Shift 1:/g) ?? []).length, 1);
+  assert.equal((alert.message.match(/📋 Shift 2:/g) ?? []).length, 0);
+
+  const uniqueIndex = db.prepare(`
+    PRAGMA index_list('telegram_outbox')
+  `).all().find((index) => index.name === 'telegram_outbox_notification_key_unique');
+  assert.equal(uniqueIndex?.unique, 1);
+});
+
+test('multiple new schedules produce one grouped message, not one copy per schedule', async (t) => {
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      data: {
+        searchScheduleCards: {
+          scheduleCards: [schedule('S-1', 'Early shift'), schedule('S-2', 'Late shift')],
+          nextToken: null,
         },
-      }),
-      telegramResponder = async () => response({ ok: true, result: { message_id: 1 } }),
-      telegramTimeoutMs = 15000,
-      notificationBaseBackoffMs = 5000,
-      notificationMaxBackoffMs = 60 * 60 * 1000,
-      amazonMaxConcurrentRequests = 3,
-      amazonMaxRequestAttempts = 3,
-      amazonForbiddenCooldownMs = 15 * 60 * 1000,
-    } = {}) {
-      const amazonCalls = [];
-      const telegramCalls = [];
-      const scanner = createScanner({
-        databasePath,
-        clock: () => currentTime,
-        sleep: async () => {},
-        logger: QUIET_LOGGER,
-        amazonMaxConcurrentRequests,
-        amazonMinimumRequestIntervalMs: 0,
-        amazonMaxRequestAttempts,
-        amazonForbiddenCooldownMs,
-        telegramTimeoutMs,
-        notificationBaseBackoffMs,
-        notificationMaxBackoffMs,
-        fetchImpl: async (url, options) => {
-          const request = JSON.parse(options.body);
-          amazonCalls.push({ url, options, operationName: request.operationName });
-          return request.operationName === 'searchJobCardsByLocation'
-            ? jobSearchResponder(url, options, scanner)
-            : amazonResponder(url, options);
-        },
-        telegramTransport: async (message, options) => {
-          telegramCalls.push({ message, options });
-          return telegramResponder(message, options);
-        },
-      });
-      let closed = false;
-      const close = () => {
-        if (!closed) {
-          scanner.close();
-          closed = true;
-        }
-      };
-      closeCallbacks.push(close);
-      return { scanner, amazonCalls, telegramCalls, close };
-    },
-  };
-}
-
-async function processJob(fixture, jobId, discoveredAt = 'test') {
-  fixture.scanner.db.prepare(
-    "INSERT INTO job_queue (job_id, region, status, discovered_at) VALUES (?, 'London', 'PENDING', ?)",
-  ).run(jobId, discoveredAt);
-  await fixture.scanner.runLoop2Schedules();
-  await fixture.scanner.waitForNotificationDelivery();
-}
-
-function getNotification(scanner, scheduleId = DEFAULT_SCHEDULE.scheduleId) {
-  return scanner.db.prepare(
-    'SELECT * FROM telegram_notifications WHERE schedule_id = ?',
-  ).get(scheduleId);
-}
-
-test('schedule and notification are saved atomically and preserve existing database records', async (t) => {
-  const context = createContext(t);
-  const legacyDb = new Database(context.databasePath);
-  legacyDb.exec(`
-    CREATE TABLE seen_schedules (id TEXT PRIMARY KEY, discovered_at TEXT);
-    CREATE TABLE job_queue (
-      job_id TEXT PRIMARY KEY,
-      region TEXT,
-      status TEXT DEFAULT 'PENDING',
-      discovered_at TEXT
-    );
-    CREATE TABLE failed_requests (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      task_type TEXT,
-      payload TEXT,
-      error TEXT,
-      retry_count INTEGER DEFAULT 0,
-      last_tried TEXT
-    );
-  `);
-  legacyDb.prepare(
-    'INSERT INTO seen_schedules (id, discovered_at) VALUES (?, ?)',
-  ).run('OLD-SHIFT', 'old-record');
-  legacyDb.close();
-
-  const fixture = context.createFixture({
-    telegramResponder: async () => response({ ok: false, description: 'retry later' }),
-  });
-  assert.deepEqual(
-    fixture.scanner.db.prepare('SELECT id, discovered_at FROM seen_schedules').all(),
-    [{ id: 'OLD-SHIFT', discovered_at: 'old-record' }],
-  );
-  assert.equal(
-    fixture.scanner.db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'telegram_notifications'").get().name,
-    'telegram_notifications',
-  );
-
-  fixture.scanner.db.exec(`
-    CREATE TRIGGER reject_notification_insert
-    BEFORE INSERT ON telegram_notifications
-    BEGIN
-      SELECT RAISE(ABORT, 'test transaction rollback');
-    END;
-  `);
-  await processJob(fixture, 'JOB-ROLLBACK');
-  fixture.scanner.db.exec('DROP TRIGGER reject_notification_insert');
-
-  assert.equal(
-    fixture.scanner.db.prepare("SELECT COUNT(*) AS count FROM seen_schedules WHERE id = 'SHIFT-1'").get().count,
-    0,
-  );
-  assert.equal(
-    fixture.scanner.db.prepare("SELECT COUNT(*) AS count FROM telegram_notifications WHERE schedule_id = 'SHIFT-1'").get().count,
-    0,
-  );
-  assert.deepEqual(
-    fixture.scanner.db.prepare('SELECT id, discovered_at FROM seen_schedules').all(),
-    [{ id: 'OLD-SHIFT', discovered_at: 'old-record' }],
-  );
-});
-
-test('successful delivery preserves the exact alert format and records sent time and attempts', async (t) => {
-  const context = createContext(t);
-  const fixture = context.createFixture();
-
-  await processJob(fixture, 'JOB-1');
-
-  const notification = getNotification(fixture.scanner);
-  assert.equal(notification.status, 'SENT');
-  assert.equal(notification.attempt_count, 1);
-  assert.equal(notification.sent_at, new Date(context.getTime()).toISOString());
-  assert.equal(notification.last_error, null);
-  assert.equal(fixture.telegramCalls.length, 1);
-  assert.equal(
-    fixture.telegramCalls[0].message,
-    '1️⃣ 📍 London Warehouse\n' +
-      '📮 Postcode: E1 6AN\n' +
-      '💰 Pay: £17.25 /hr\n' +
-      '📅 Start Date: 2026-12-01\n' +
-      '📆 Working Days: Monday-Friday\n' +
-      '⏰ Shift Time: 07:00 - 15:30\n' +
-      '🕐 Hours/Week: 30',
-  );
-});
-
-test('Loop 2 skips overlapping passes and accepts the next pass afterward', async (t) => {
-  const context = createContext(t);
-  let releaseFirstRequest;
-  let signalFirstRequestStarted;
-  const firstRequestGate = new Promise((resolveGate) => {
-    releaseFirstRequest = resolveGate;
-  });
-  const firstRequestStarted = new Promise((resolveStarted) => {
-    signalFirstRequestStarted = resolveStarted;
-  });
-  let amazonCallCount = 0;
-  const fixture = context.createFixture({
-    jobSearchResponder: async () => {
-      amazonCallCount += 1;
-      signalFirstRequestStarted();
-      if (amazonCallCount === 1) await firstRequestGate;
-      return response({
-        data: {
-          searchJobCardsByLocation: {
-            jobCards: [],
-            nextToken: null,
-          },
-        },
-      });
-    },
-  });
-
-  const firstPass = fixture.scanner.runLoop2Schedules();
-  await firstRequestStarted;
-  assert.equal(amazonCallCount, 1);
-
-  await fixture.scanner.runLoop2Schedules();
-  assert.equal(amazonCallCount, 1);
-
-  releaseFirstRequest();
-  await firstPass;
-  await fixture.scanner.runLoop2Schedules();
-  assert.equal(amazonCallCount, 2);
-});
-
-test('Loop 2 releases its guard after a processing error', async (t) => {
-  const context = createContext(t);
-  let scheduleCallCount = 0;
-  const fixture = context.createFixture({
-    amazonResponder: async () => {
-      scheduleCallCount += 1;
-      if (scheduleCallCount <= 3) throw new Error('mock schedule request failure');
-      return response({ data: { searchScheduleCards: [] } });
-    },
-  });
-
-  await processJob(fixture, 'JOB-ERROR');
-  assert.equal(
-    fixture.scanner.db.prepare(
-      "SELECT status FROM job_queue WHERE job_id = 'JOB-ERROR'",
-    ).get().status,
-    'FAILED',
-  );
-
-  await processJob(fixture, 'JOB-RECOVERS');
-  assert.equal(scheduleCallCount, 4);
-  assert.equal(
-    fixture.scanner.db.prepare(
-      "SELECT status FROM job_queue WHERE job_id = 'JOB-RECOVERS'",
-    ).get().status,
-    'PROCESSED',
-  );
-});
-
-test('HTTP errors and Telegram ok:false remain pending and are not marked sent', async (t) => {
-  const cases = [
-    {
-      name: 'HTTP error even when the JSON says ok',
-      telegramResponder: async () => response({ ok: true }, 503),
-      expectedError: /HTTP 503/,
-    },
-    {
-      name: 'HTTP success with Telegram ok:false',
-      telegramResponder: async () => response({ ok: false, description: 'chat unavailable' }),
-      expectedError: /chat unavailable/,
-    },
-  ];
-
-  for (const scenario of cases) {
-    await t.test(scenario.name, async (subtest) => {
-      const context = createContext(subtest);
-      const fixture = context.createFixture({
-        telegramResponder: scenario.telegramResponder,
-      });
-      await processJob(fixture, `JOB-${scenario.name}`);
-
-      const notification = getNotification(fixture.scanner);
-      assert.equal(notification.status, 'PENDING');
-      assert.equal(notification.attempt_count, 1);
-      assert.equal(notification.sent_at, null);
-      assert.match(notification.last_error, scenario.expectedError);
-    });
-  }
-});
-
-test('network errors and request timeouts remain queued for retry', async (t) => {
-  await t.test('network rejection', async (subtest) => {
-    const context = createContext(subtest);
-    const fixture = context.createFixture({
-      telegramResponder: async () => {
-        throw new Error('mock network reset');
       },
-    });
-    await processJob(fixture, 'JOB-NETWORK');
-
-    const notification = getNotification(fixture.scanner);
-    assert.equal(notification.status, 'PENDING');
-    assert.equal(notification.sent_at, null);
-    assert.match(notification.last_error, /mock network reset/);
+    }),
   });
 
-  await t.test('timeout signal', async (subtest) => {
-    const context = createContext(subtest);
-    const fixture = context.createFixture({
-      telegramTimeoutMs: 5,
-      telegramResponder: async (_message, { signal }) => new Promise((_resolve, reject) => {
-        if (signal.aborted) {
-          reject(signal.reason);
-          return;
-        }
-        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
-      }),
-    });
-    await processJob(fixture, 'JOB-TIMEOUT');
+  const result = await harness.api.processDiscoveredJob(job, new Date().toISOString());
+  const alerts = harness.api.db.prepare('SELECT * FROM telegram_outbox').all();
 
-    const notification = getNotification(fixture.scanner);
-    assert.equal(notification.status, 'PENDING');
-    assert.equal(notification.sent_at, null);
-    assert.ok(notification.last_error);
-  });
+  assert.equal(result.count, 2);
+  assert.equal(alerts.length, 1);
+  assert.deepEqual(JSON.parse(alerts[0].schedule_ids), ['S-1', 'S-2']);
+  assert.equal((alerts[0].message.match(/📋 Shift 1:/g) ?? []).length, 1);
+  assert.equal((alerts[0].message.match(/📋 Shift 2:/g) ?? []).length, 1);
 });
 
-test('retry delay doubles to its cap and notifications are never discarded', async (t) => {
-  const context = createContext(t);
-  const fixture = context.createFixture({
-    notificationMaxBackoffMs: 20000,
-    telegramResponder: async () => response({ ok: false, description: 'offline' }),
+test('Telegram worker cycles do not overlap while a request is in flight', async (t) => {
+  let resolveTelegram;
+  let signalStarted;
+  const started = new Promise((resolve) => { signalStarted = resolve; });
+  const responsePending = new Promise((resolve) => { resolveTelegram = resolve; });
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-WORKER', 'Night shift')] } },
+    }),
+    telegramResponder: async () => {
+      signalStarted();
+      return responsePending;
+    },
   });
-  await processJob(fixture, 'JOB-BACKOFF');
+  await harness.api.processDiscoveredJob(job, new Date().toISOString());
+  harness.api.startTelegramWorker();
+  assert.equal(harness.intervals.length, 1);
+  assert.equal(harness.intervals[0].milliseconds, 1000);
 
-  let notification = getNotification(fixture.scanner);
+  const firstCycle = harness.intervals[0].callback();
+  await started;
+  await harness.intervals[0].callback();
+  assert.equal(harness.telegramCalls.length, 1);
+  resolveTelegram(mockResponse({ ok: true, result: { message_id: 1 } }));
+  await firstCycle;
+
+  assert.equal(harness.telegramCalls.length, 1);
+  assert.equal(
+    harness.api.db.prepare('SELECT status FROM telegram_outbox').get().status,
+    'sent',
+  );
+});
+
+test('HTTP success with Telegram ok:false is retried, never marked sent, then fails safely', async (t) => {
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-FAIL', 'Weekend shift')] } },
+    }),
+    telegramResponder: async () => mockResponse({ ok: false, description: 'rejected' }),
+  });
+  await harness.api.processDiscoveredJob(job, new Date().toISOString());
+  harness.api.startTelegramWorker();
+  const runCycle = harness.intervals[0].callback;
+
+  await runCycle();
+  let notification = harness.api.db.prepare('SELECT * FROM telegram_outbox').get();
+  assert.equal(notification.status, 'pending');
   assert.equal(notification.attempt_count, 1);
-  assert.equal(Date.parse(notification.next_attempt_at) - context.getTime(), 5000);
+  assert.equal(notification.last_error.includes('rejected'), true);
+  assert.equal(
+    harness.api.db.prepare('SELECT telegram_sent_at FROM discovered_schedules').get().telegram_sent_at,
+    null,
+  );
 
-  for (const expectedDelay of [10000, 20000, 20000]) {
-    context.setTime(Date.parse(notification.next_attempt_at));
-    await fixture.scanner.runNotificationDelivery();
-    notification = getNotification(fixture.scanner);
-    assert.equal(notification.status, 'PENDING');
-    assert.equal(notification.sent_at, null);
-    assert.equal(
-      Date.parse(notification.next_attempt_at) - context.getTime(),
-      expectedDelay,
-    );
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    harness.api.db.prepare(
+      "UPDATE telegram_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = 1",
+    ).run();
+    await runCycle();
   }
-
-  assert.equal(notification.attempt_count, 4);
-  assert.equal(
-    fixture.scanner.db.prepare('SELECT COUNT(*) AS count FROM telegram_notifications').get().count,
-    1,
-  );
+  notification = harness.api.db.prepare('SELECT * FROM telegram_outbox').get();
+  assert.equal(notification.status, 'failed');
+  assert.equal(notification.attempt_count, 3);
+  const attempts = harness.telegramCalls.length;
+  await runCycle();
+  assert.equal(harness.telegramCalls.length, attempts);
 });
 
-test('pending notifications survive a restart and are delivered by the next process', async (t) => {
-  const context = createContext(t);
-  const firstProcess = context.createFixture({
-    telegramResponder: async () => response({ ok: false, description: 'temporary failure' }),
-  });
-  await processJob(firstProcess, 'JOB-RESTART');
-  const pending = getNotification(firstProcess.scanner);
-  assert.equal(pending.status, 'PENDING');
-  firstProcess.close();
-
-  context.setTime(Date.parse(pending.next_attempt_at));
-  const restartedProcess = context.createFixture();
-  const result = await restartedProcess.scanner.runNotificationDelivery();
-
-  assert.deepEqual(result, { sentCount: 1, failedCount: 0 });
-  const delivered = getNotification(restartedProcess.scanner);
-  assert.equal(delivered.status, 'SENT');
-  assert.equal(delivered.attempt_count, 2);
-  assert.ok(delivered.sent_at);
-});
-
-test('an expired claim left by a stopped process is recovered after restart', async (t) => {
-  const context = createContext(t);
-  const firstProcess = context.createFixture({
-    telegramResponder: async () => response({ ok: false, description: 'temporary failure' }),
-  });
-  await processJob(firstProcess, 'JOB-EXPIRED-CLAIM');
-  firstProcess.scanner.db.prepare(`
-    UPDATE telegram_notifications
-    SET status = 'CLAIMED',
-        attempt_count = 2,
-        claim_token = 'abandoned-worker',
-        claim_expires_at = ?
-    WHERE schedule_id = 'SHIFT-1'
-  `).run(new Date(context.getTime() + 60000).toISOString());
-  firstProcess.close();
-
-  context.setTime(context.getTime() + 60000);
-  const restartedProcess = context.createFixture();
-  await restartedProcess.scanner.runNotificationDelivery();
-
-  const recovered = getNotification(restartedProcess.scanner);
-  assert.equal(recovered.status, 'SENT');
-  assert.equal(recovered.attempt_count, 3);
-  assert.ok(recovered.sent_at);
-});
-
-test('two workers cannot claim and send the same notification simultaneously', async (t) => {
-  const context = createContext(t);
-  const seeder = context.createFixture({
-    telegramResponder: async () => response({ ok: false, description: 'retry' }),
-  });
-  await processJob(seeder, 'JOB-WORKERS');
-  const pending = getNotification(seeder.scanner);
-  seeder.close();
-  context.setTime(Date.parse(pending.next_attempt_at));
-
-  let releaseFirstWorker;
-  const firstWorkerGate = new Promise((resolveGate) => {
-    releaseFirstWorker = resolveGate;
-  });
-  let firstWorkerSends = 0;
-  let secondWorkerSends = 0;
-  const firstWorker = context.createFixture({
+test('failed network delivery is recorded and retried only after backoff', async (t) => {
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-NET', 'Day shift')] } },
+    }),
     telegramResponder: async () => {
-      firstWorkerSends += 1;
-      await firstWorkerGate;
-      return response({ ok: true });
+      throw new Error('mock network failure');
     },
   });
-  const secondWorker = context.createFixture({
-    telegramResponder: async () => {
-      secondWorkerSends += 1;
-      return response({ ok: true });
+  await harness.api.processDiscoveredJob(job, new Date().toISOString());
+  harness.api.startTelegramWorker();
+  const runCycle = harness.intervals[0].callback;
+
+  await runCycle();
+  const notification = harness.api.db.prepare('SELECT * FROM telegram_outbox').get();
+  assert.equal(notification.status, 'pending');
+  assert.equal(notification.attempt_count, 1);
+  assert.match(notification.last_error, /mock network failure/);
+  assert.ok(Date.parse(notification.next_attempt_at) > Date.now());
+
+  await runCycle();
+  assert.equal(harness.telegramCalls.length, 1);
+});
+
+test('job discovery, queue, and Telegram timestamps are ISO 8601 and latencies parse correctly', async (t) => {
+  const logs = [];
+  const harness = createScannerHarness(t, {
+    prepareDatabase(db) {
+      db.exec(`
+        CREATE TABLE discovered_schedules (
+          schedule_id TEXT PRIMARY KEY,
+          discovered_at TEXT,
+          amazon_detected_at TEXT,
+          notification_queued_at TEXT,
+          telegram_sent_at TEXT
+        );
+        INSERT INTO discovered_schedules (
+          schedule_id, discovered_at, amazon_detected_at,
+          notification_queued_at, telegram_sent_at
+        ) VALUES (
+          'S-OLD-TIMES', '2026-11-14 12:00:00', '2026-11-14 12:00:01',
+          '2026-11-14 12:00:02', '2026-11-14 12:00:03'
+        );
+      `);
+    },
+    jobResponder: async () => mockResponse({
+      data: {
+        searchJobCardsByLocation: {
+          jobCards: [{ ...job, jobId: 'JOB-TIMESTAMP' }],
+          nextToken: null,
+        },
+      },
+    }),
+    scheduleResponder: async () => mockResponse({
+      data: {
+        searchScheduleCards: {
+          scheduleCards: [schedule('S-TIMESTAMP', 'Timestamped shift')],
+          nextToken: null,
+        },
+      },
+    }),
+    logger: {
+      log: (...values) => logs.push(values.join(' ')),
+      warn() {},
+      error() {},
     },
   });
 
-  const firstDelivery = firstWorker.scanner.runNotificationDelivery();
-  assert.equal(firstWorkerSends, 1);
-  const secondResult = await secondWorker.scanner.runNotificationDelivery();
+  const feed = await harness.api.fetchAmazonJobFeed();
+  const discoveredJob = feed.jobCards[0];
+  const detectedAt = discoveredJob._scannerDetectedAt;
+  assert.match(detectedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  await harness.api.processDiscoveredJob(discoveredJob, detectedAt);
 
-  assert.deepEqual(secondResult, { sentCount: 0, failedCount: 0 });
-  assert.equal(secondWorkerSends, 0);
-  assert.equal(getNotification(secondWorker.scanner).status, 'CLAIMED');
+  const detectedRecord = harness.api.db.prepare(
+    "SELECT * FROM discovered_schedules WHERE schedule_id = 'S-TIMESTAMP'",
+  ).get();
+  assert.equal(detectedRecord.discovered_at, detectedAt);
+  assert.equal(detectedRecord.amazon_detected_at, detectedAt);
+  assert.match(detectedRecord.notification_queued_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
 
-  releaseFirstWorker();
-  await firstDelivery;
-  assert.equal(getNotification(firstWorker.scanner).status, 'SENT');
-  assert.equal(getNotification(firstWorker.scanner).attempt_count, 2);
-});
+  harness.api.startTelegramWorker();
+  await harness.intervals[0].callback();
+  const sentRecord = harness.api.db.prepare(
+    "SELECT * FROM discovered_schedules WHERE schedule_id = 'S-TIMESTAMP'",
+  ).get();
+  assert.match(sentRecord.telegram_sent_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
 
-test('a repeated schedule creates only one notification record', async (t) => {
-  const context = createContext(t);
-  const fixture = context.createFixture({
-    telegramResponder: async () => response({ ok: false, description: 'retry' }),
-  });
+  const detectedMs = Date.parse(sentRecord.amazon_detected_at);
+  const queuedMs = Date.parse(sentRecord.notification_queued_at);
+  const sentMs = Date.parse(sentRecord.telegram_sent_at);
+  assert.ok(queuedMs >= detectedMs);
+  assert.ok(sentMs >= queuedMs);
+  assert.ok(logs.some((line) => line.includes(
+    `Discovery->Queue: ${queuedMs - detectedMs}ms | Queue->Telegram: ${sentMs - queuedMs}ms | Total Pipeline: ${sentMs - detectedMs}ms`,
+  )));
 
-  await processJob(fixture, 'JOB-DUPLICATE-1');
-  await processJob(fixture, 'JOB-DUPLICATE-2');
-
-  assert.equal(
-    fixture.scanner.db.prepare(
-      "SELECT COUNT(*) AS count FROM telegram_notifications WHERE schedule_id = 'SHIFT-1'",
-    ).get().count,
-    1,
-  );
-  assert.equal(
-    fixture.scanner.db.prepare(
-      "SELECT COUNT(*) AS count FROM seen_schedules WHERE id = 'SHIFT-1'",
-    ).get().count,
-    1,
-  );
+  const migrated = harness.api.db.prepare(
+    "SELECT * FROM discovered_schedules WHERE schedule_id = 'S-OLD-TIMES'",
+  ).get();
+  assert.equal(migrated.discovered_at, '2026-11-14T12:00:00.000Z');
+  assert.equal(migrated.amazon_detected_at, '2026-11-14T12:00:01.000Z');
+  assert.equal(migrated.notification_queued_at, '2026-11-14T12:00:02.000Z');
+  assert.equal(migrated.telegram_sent_at, '2026-11-14T12:00:03.000Z');
 });
