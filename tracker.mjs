@@ -138,7 +138,7 @@ async function fetchSchedulesForJob(jobId) {
   let allSchedules = [];
   let nextToken = null;
   let pageCount = 0;
-  const maxPages = 5; // Safety limit per job
+  const maxPages = 5;
 
   do {
     pageCount++;
@@ -207,7 +207,7 @@ async function fetchSchedulesForJob(jobId) {
   return allSchedules;
 }
 
-// --- CORE JOB & SCHEDULE PROCESSOR (Atomic Dedup & Timestamps) ---
+// --- CORE JOB & SCHEDULE PROCESSOR ---
 async function processDiscoveredJob(job, amazonDetectedAt) {
   const scheduleCards = await fetchSchedulesForJob(job.jobId);
 
@@ -223,7 +223,6 @@ async function processDiscoveredJob(job, amazonDetectedAt) {
       validSchedules.push(card);
     }
   } else {
-    // Fallback if schedule endpoint returns empty
     const fallbackId = `${job.jobId}-fallback`;
     const res = stmtClaimSchedule.run(fallbackId, amazonDetectedAt);
     if (res.changes === 1) {
@@ -237,7 +236,6 @@ async function processDiscoveredJob(job, amazonDetectedAt) {
     });
   }
 
-  // If at least one schedule was newly claimed (Atomic deduplication passed)
   if (claimedAny) {
     const queuedAt = new Date().toISOString();
     const locationName = job.locationName || job.city || 'UK Delivery Station';
@@ -260,7 +258,7 @@ async function processDiscoveredJob(job, amazonDetectedAt) {
 
     for (const shift of validSchedules) {
       stmtUpdateQueueTime.run(queuedAt, shift.scheduleId);
-      stmtEnqueueTelegram.run(shift.scheduleId, message, queuedAt);
+      stmtEnqueueTelegram.run(shift.scheduleId, message);
     }
 
     console.log(`[DEDUP] Claimed and queued alert for job: ${job.jobId} (${locationName}) with ${shiftCount} shift(s) at ${queuedAt}`);
@@ -272,8 +270,8 @@ async function fetchAmazonJobFeed() {
   let allJobCards = [];
   let nextToken = null;
   let pageCount = 0;
-  let scanStatus = 'COMPLETE'; // COMPLETE | PARTIAL | BLOCKED
-  const maxPages = 10; // Safeguard limit for feed pagination
+  let scanStatus = 'COMPLETE';
+  const maxPages = 10;
 
   do {
     pageCount++;
@@ -358,7 +356,7 @@ async function fetchAmazonJobFeed() {
   return { jobCards: allJobCards, scanStatus };
 }
 
-// --- ORGANIC REQUEST JITTER (3-5 seconds) ---
+// --- ORGANIC REQUEST JITTER ---
 async function randomizedDelay() {
   const jitter = Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000;
   await new Promise(resolve => setTimeout(resolve, jitter));
