@@ -444,15 +444,10 @@ function activateAmazonCooldown(reason, durationMs, loopName, operation, control
 
   try {
     const markerRecords = readAmazonProtectionMarkers();
-    let databaseState;
-    try {
-      databaseState = stmtGetAmazonProtection.get();
-    } catch {
-      // Still journal the known cooldown if SQLite itself cannot be read.
-    }
+    // Journal the failure using every durable/in-memory value known without
+    // consulting SQLite. A failed SQLite read must not erase this response.
     merged = mergeProtectionRecords([
       ...markerRecords,
-      databaseState,
       pendingProtectionWrite,
       candidate,
     ]);
@@ -461,9 +456,34 @@ function activateAmazonCooldown(reason, durationMs, loopName, operation, control
       writeAmazonProtectionMarker(merged);
       markerWritten = true;
     } catch {
-      // Still try SQLite: either durable store can preserve the cooldown.
+      // Continue to SQLite; either durable store may still preserve the cooldown.
     }
     pendingProtectionWrite = merged;
+
+    let databaseState;
+    try {
+      databaseState = stmtGetAmazonProtection.get();
+    } catch {
+      // The marker already contains the received failure and remains on disk.
+    }
+
+    if (databaseState) {
+      merged = mergeProtectionRecords([
+        ...markerRecords,
+        databaseState,
+        pendingProtectionWrite,
+        candidate,
+      ]);
+      try {
+        writeAmazonProtectionMarker(merged);
+        markerWritten = true;
+      } catch {
+        // Keep the previously written marker and fail closed after the DB attempt.
+        markerWritten = false;
+      }
+      pendingProtectionWrite = merged;
+    }
+
     const persisted = persistAmazonProtectionAtomically(merged);
     merged = mergeProtectionRecords([merged, persisted]);
     stateWasPersisted = true;
@@ -566,19 +586,6 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
       );
       return null;
     }
-    const responseProtection = getAmazonProtectionState();
-    if (responseProtection.blocked) {
-      controller.abort({
-        type: 'amazon-shared-cooldown',
-        reason: responseProtection.reason,
-      });
-      try {
-        await Promise.race([response.body?.cancel?.(), aborted]);
-      } catch {
-        // The response is discarded while the shared cooldown remains active.
-      }
-      return null;
-    }
     const cooldown = !response.ok ? amazonFailureCooldown(response) : null;
     if (cooldown) {
       const expiry = activateAmazonCooldown(
@@ -592,14 +599,29 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
       try {
         await Promise.race([response.body?.cancel?.(), aborted]);
       } catch {
-        // Closing an already-aborted or empty error body must not disable cooldown protection.
+        // Closing an already-aborted or empty error body must not disable protection.
       }
       console.warn(
         `[AmazonRequest] loop=${loopName} operation=${operation} status=${response.status} `
         + `durationMs=${Date.now() - startedAt} cooldownExpiresAt=${expiry} scan=BLOCKED`,
       );
       return { response, data: null };
-    } else {
+    }
+
+    const responseProtection = getAmazonProtectionState();
+    if (responseProtection.blocked) {
+      controller.abort({
+        type: 'amazon-shared-cooldown',
+        reason: responseProtection.reason,
+      });
+      try {
+        await Promise.race([response.body?.cancel?.(), aborted]);
+      } catch {
+        // The response is discarded while the shared cooldown remains active.
+      }
+      return null;
+    }
+    {
       const data = response.ok ? await Promise.race([response.json(), aborted]) : null;
       if (controller.signal.aborted
         && controller.signal.reason?.type !== 'amazon-shared-cooldown') {

@@ -48,6 +48,48 @@ const setupHarness = (databasePath, extra = '') => `
   });
 `;
 
+for (const [status, expectedReason] of [
+  [401, 'http_401_authentication'],
+  [403, 'http_403'],
+  [429, 'http_429'],
+  [503, 'http_503'],
+]) {
+  test(`HTTP ${status} is journaled before SQLite read failure and recovered after process restart`, async (t) => {
+    const databasePath = databaseFixture(t);
+    let first;
+    first = createScannerHarness(t, {
+      databasePath,
+      jobResponder: async () => {
+        // Simulate the reported sequence: response received, then SQLite state
+        // becomes unreadable before the protection update can query it.
+        first.api.db.close();
+        return mockResponse(
+          {},
+          status,
+          status === 429 ? { 'Retry-After': '90' } : {},
+        );
+      },
+    });
+
+    const initial = await first.api.fetchAmazonJobFeed('Loop-1');
+    const markerPath = first.api.recoveryMarkerPath;
+    assert.equal(initial.scanStatus, status === 401 || status === 403 ? 'BLOCKED' : 'PARTIAL');
+    assert.equal(existsSync(markerPath), true);
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8'));
+    assert.equal(marker.reason, expectedReason);
+    if (status === 429) {
+      assert.ok(Date.parse(marker.expires_at) >= Date.now() + 89000);
+    }
+
+    const restarted = createScannerHarness(t, { databasePath });
+    const afterRestart = await restarted.api.fetchAmazonJobFeed('Loop-2');
+    assert.equal(afterRestart.scanStatus, 'BLOCKED');
+    assert.equal(restarted.amazonCalls.length, 0);
+    assert.equal(row(restarted).reason, expectedReason);
+    assert.equal(row(restarted).expires_at, marker.expires_at);
+  });
+}
+
 test('SQLite write failure survives a real child-process exit and restart', (t) => {
   const databasePath = databaseFixture(t);
   const failed = childRun(databasePath, setupHarness(databasePath, `
