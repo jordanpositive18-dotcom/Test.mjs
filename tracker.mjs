@@ -568,24 +568,6 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
       aborted,
     ]);
     status = response.status;
-    if (controller.signal.aborted
-      && controller.signal.reason?.type !== 'amazon-shared-cooldown') {
-      throw new Error('Amazon request aborted before response acceptance');
-    }
-    if (controller.signal.reason?.type === 'amazon-shared-cooldown') {
-      try {
-        await Promise.race([response.body?.cancel?.(), aborted]);
-      } catch {
-        // Discard an already-aborted response.
-      }
-      const state = getAmazonProtectionState();
-      console.warn(
-        `[AmazonRequest] loop=${loopName} operation=${operation} status=aborted `
-        + `durationMs=${Date.now() - startedAt} cooldownReason=${state.reason ?? 'shared_cooldown'} `
-        + `cooldownExpiresAt=${state.expiresAt ?? 'unknown'} scan=BLOCKED`,
-      );
-      return null;
-    }
     const cooldown = !response.ok ? amazonFailureCooldown(response) : null;
     if (cooldown) {
       const expiry = activateAmazonCooldown(
@@ -606,6 +588,25 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
         + `durationMs=${Date.now() - startedAt} cooldownExpiresAt=${expiry} scan=BLOCKED`,
       );
       return { response, data: null };
+    }
+
+    if (controller.signal.aborted
+      && controller.signal.reason?.type !== 'amazon-shared-cooldown') {
+      throw new Error('Amazon request aborted before response acceptance');
+    }
+    if (controller.signal.reason?.type === 'amazon-shared-cooldown') {
+      try {
+        await Promise.race([response.body?.cancel?.(), aborted]);
+      } catch {
+        // Discard an already-aborted response.
+      }
+      const state = getAmazonProtectionState();
+      console.warn(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=aborted `
+        + `durationMs=${Date.now() - startedAt} cooldownReason=${state.reason ?? 'shared_cooldown'} `
+        + `cooldownExpiresAt=${state.expiresAt ?? 'unknown'} scan=BLOCKED`,
+      );
+      return null;
     }
 
     const responseProtection = getAmazonProtectionState();

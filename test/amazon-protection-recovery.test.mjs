@@ -90,6 +90,90 @@ for (const [status, expectedReason] of [
   });
 }
 
+test('a protected response from a shared-aborted request upgrades the shorter cooldown', async (t) => {
+  let h;
+  let jsonReads = 0;
+  let shorterCooldownActivated = false;
+  const payload = {
+    data: {
+      searchJobCardsByLocation: {
+        jobCards: [{ jobId: 'MUST_NOT_PROCESS' }],
+        nextToken: null,
+      },
+    },
+  };
+  h = createScannerHarness(t, {
+    jobResponder: async () => {
+      const response = mockResponse(payload, 403);
+      return {
+        ok: false,
+        headers: response.headers,
+        get status() {
+          if (!shorterCooldownActivated) {
+            shorterCooldownActivated = true;
+            // Simulate another in-flight request activating a shorter shared
+            // cooldown immediately before this already-aborted response is read.
+            activate(h, 'http_503', 30000);
+          }
+          return 403;
+        },
+        async json() {
+          jsonReads += 1;
+          return payload;
+        },
+      };
+    },
+  });
+
+  const result = await h.api.fetchAmazonJobFeed('Loop-2');
+  assert.equal(result.scanStatus, 'BLOCKED');
+  assert.equal(result.jobCards.length, 0);
+  assert.equal(h.amazonCalls[0].options.signal.aborted, true);
+  assert.equal(h.amazonCalls[0].options.signal.reason.type, 'amazon-shared-cooldown');
+  assert.equal(jsonReads, 0);
+  assert.equal(row(h).reason, 'http_403');
+  assert.ok(Date.parse(row(h).expires_at) >= Date.now() + 14 * 60 * 1000);
+  assert.equal(countRows(h.api.db, 'discovered_schedules'), 0);
+  assert.equal(countRows(h.api.db, 'telegram_outbox'), 0);
+});
+
+test('SQLite read failure recovery survives a real child-process restart', (t) => {
+  const databasePath = databaseFixture(t);
+  const first = childRun(databasePath, setupHarness(databasePath, `
+    jobResponder: async () => {
+      h.api.db.close();
+      return mockResponse({}, 403);
+    },
+  `), `
+    const result = await h.api.fetchAmazonJobFeed('Loop-1');
+    return {
+      status: result.scanStatus,
+      calls: h.amazonCalls.length,
+      marker: JSON.parse(readFileSync(h.api.recoveryMarkerPath, 'utf8')),
+    };
+  `);
+  assert.equal(first.status, 'BLOCKED');
+  assert.equal(first.calls, 1);
+  assert.equal(first.marker.reason, 'http_403');
+
+  const restarted = childRun(databasePath, setupHarness(databasePath), `
+    const result = await h.api.fetchAmazonJobFeed('Loop-2');
+    return {
+      status: result.scanStatus,
+      calls: h.amazonCalls.length,
+      saved: h.api.db.prepare(
+        'SELECT reason, expires_at FROM amazon_request_protection WHERE id = 1',
+      ).get(),
+      markerExists: existsSync(h.api.recoveryMarkerPath),
+    };
+  `);
+  assert.equal(restarted.status, 'BLOCKED');
+  assert.equal(restarted.calls, 0);
+  assert.equal(restarted.saved.reason, 'http_403');
+  assert.equal(restarted.saved.expires_at, first.marker.expires_at);
+  assert.equal(restarted.markerExists, false);
+});
+
 test('SQLite write failure survives a real child-process exit and restart', (t) => {
   const databasePath = databaseFixture(t);
   const failed = childRun(databasePath, setupHarness(databasePath, `
