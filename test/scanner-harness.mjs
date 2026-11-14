@@ -37,6 +37,7 @@ export function createScannerHarness(t, {
   prepareDatabase = () => {},
   timeoutHandler = () => {},
   logger = { log() {}, warn() {}, error() {} },
+  env = {},
 } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'amazon-restored-scanner-'));
   const databasePath = join(directory, 'test.sqlite');
@@ -108,6 +109,7 @@ globalThis.__testApi = {
       env: {
         TELEGRAM_BOT_TOKEN: 'offline-test-token',
         TELEGRAM_CHAT_ID: 'offline-test-chat',
+        ...env,
       },
     },
     console: logger,

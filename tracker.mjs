@@ -152,8 +152,12 @@ const stmtGetTelemetryTimestamps = db.prepare(`
 // Configuration from environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const AMAZON_AUTH_TOKEN = process.env.AMAZON_AUTH_TOKEN || process.env.AUTHORIZATION;
-const PROXY_URL = process.env.SHIFT_PROXY_URL || process.env.PROXY_URL;
+const AMAZON_AUTH_TOKEN = process.env.AMAZON_AUTHORIZATION
+  || process.env.AMAZON_AUTH_TOKEN
+  || process.env.AUTHORIZATION;
+const PROXY_URL = process.env.AMAZON_PROXY_URL
+  || process.env.SHIFT_PROXY_URL
+  || process.env.PROXY_URL;
 
 // Configure Undici proxy agent if proxy is provided
 let dispatcher = undefined;

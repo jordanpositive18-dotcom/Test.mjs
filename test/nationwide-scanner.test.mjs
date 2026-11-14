@@ -60,6 +60,60 @@ test('job feed preserves Amazon request URL, query, variables and headers', asyn
   });
 });
 
+test('Railway Amazon variables are applied to both job and schedule requests', async (t) => {
+  const harness = createScannerHarness(t, {
+    env: {
+      AMAZON_PROXY_URL: 'http://amazon-proxy.test:8080',
+      SHIFT_PROXY_URL: 'http://fallback-proxy.test:8080',
+      PROXY_URL: 'http://legacy-proxy.test:8080',
+      AMAZON_AUTHORIZATION: 'mock-amazon-authorization',
+      AMAZON_AUTH_TOKEN: 'mock-fallback-authorization',
+      AUTHORIZATION: 'mock-legacy-authorization',
+    },
+  });
+
+  await harness.api.fetchAmazonJobFeed();
+  await harness.api.fetchSchedulesForJob(jobSource.jobId);
+
+  assert.equal(harness.amazonCalls.length, 2);
+  for (const { options } of harness.amazonCalls) {
+    assert.equal(options.dispatcher.url, 'http://amazon-proxy.test:8080');
+    assert.equal(options.headers.Authorization, 'mock-amazon-authorization');
+  }
+});
+
+test('legacy proxy and authorization environment-variable fallbacks remain supported', async (t) => {
+  const firstFallbackHarness = createScannerHarness(t, {
+    env: {
+      SHIFT_PROXY_URL: 'http://shift-proxy.test:8080',
+      PROXY_URL: 'http://legacy-proxy.test:8080',
+      AMAZON_AUTH_TOKEN: 'mock-amazon-token',
+      AUTHORIZATION: 'mock-legacy-authorization',
+    },
+  });
+  await firstFallbackHarness.api.fetchAmazonJobFeed();
+  await firstFallbackHarness.api.fetchSchedulesForJob(jobSource.jobId);
+
+  for (const { options } of firstFallbackHarness.amazonCalls) {
+    assert.equal(options.dispatcher.url, 'http://shift-proxy.test:8080');
+    assert.equal(options.headers.Authorization, 'mock-amazon-token');
+  }
+
+  const finalFallbackHarness = createScannerHarness(t, {
+    env: {
+      PROXY_URL: 'http://legacy-proxy.test:8080',
+      AUTHORIZATION: 'mock-legacy-authorization',
+    },
+  });
+  await finalFallbackHarness.api.fetchAmazonJobFeed();
+  await finalFallbackHarness.api.fetchSchedulesForJob(jobSource.jobId);
+
+  for (const { options } of finalFallbackHarness.amazonCalls) {
+    assert.equal(options.dispatcher.url, 'http://legacy-proxy.test:8080');
+    assert.equal(options.headers.Authorization, 'mock-legacy-authorization');
+  }
+});
+
 test('HTTP-success job responses with GraphQL errors are logged and marked PARTIAL', async (t) => {
   const logs = [];
   const harness = createScannerHarness(t, {
