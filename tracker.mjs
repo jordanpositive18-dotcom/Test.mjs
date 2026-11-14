@@ -67,7 +67,7 @@ function startTelegramWorker() {
 
       for (const alert of pendingAlerts) {
         if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-          console.warn('[Telegram] ⚠️ Credentials missing. Skipping dispatch.');
+          console.warn('[Telegram] ⚠️ Credentials missing. Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway/Replit environment variables.');
           stmtMarkAlertFailed.run(alert.id);
           continue;
         }
@@ -109,8 +109,8 @@ function handleDiscoveredSchedule(scheduleId, jobDetails) {
 
   // Atomic SQLite check: returns 1 if this loop successfully claimed it first
   if (result.changes === 1) {
-    const location = jobDetails.location || 'Unit A and B Woodlands Industrial Storage Estate Longtown';
-    const postcode = jobDetails.postcode || 'CA6 5TR';
+    const location = jobDetails.location || 'UK Delivery Station';
+    const postcode = jobDetails.postcode || 'N/A';
     const title = jobDetails.title || 'Delivery Station Warehouse Associate';
     const shiftCount = jobDetails.shifts ? jobDetails.shifts.length : 1;
     const employment = jobDetails.employment || 'Seasonal | Full-time;Part-time';
@@ -124,19 +124,19 @@ function handleDiscoveredSchedule(scheduleId, jobDetails) {
     if (jobDetails.shifts && Array.isArray(jobDetails.shifts) && jobDetails.shifts.length > 0) {
       jobDetails.shifts.forEach((shift, index) => {
         message += `\n📋 Shift ${index + 1}:\n` +
-                   `📅 First Day: ${shift.startDate || '2026-11-28'}\n` +
-                   `⏰ Schedule: ${shift.scheduleDays || 'Working Days'} ${shift.time || '07:00 - 15:30'}\n` +
+                   `📅 First Day: ${shift.startDate || 'Upcoming'}\n` +
+                   `⏰ Schedule: ${shift.scheduleDays || 'Working Days'} ${shift.time || 'Flexible'}\n` +
                    `🕐 Hours/Week: ${shift.hoursPerWeek || '20'}\n`;
       });
     } else {
       message += `\n📋 Shift 1:\n` +
-                 `📅 First Day: ${jobDetails.startDate || '2026-11-28'}\n` +
-                 `⏰ Schedule: ${jobDetails.scheduleDays || 'Working Days'} ${jobDetails.time || '07:00 - 15:30'}\n` +
+                 `📅 First Day: ${jobDetails.startDate || 'Upcoming'}\n` +
+                 `⏰ Schedule: ${jobDetails.scheduleDays || 'Working Days'} ${jobDetails.time || 'Flexible'}\n` +
                  `🕐 Hours/Week: ${jobDetails.hoursPerWeek || '20'}\n`;
     }
 
     stmtEnqueueTelegram.run(message);
-    console.log(`[DEDUP] Claimed and queued alert for schedule: ${scheduleId}`);
+    console.log(`[DEDUP] Claimed and queued alert for schedule/job: ${scheduleId}`);
   }
 }
 
@@ -204,7 +204,7 @@ async function fetchAmazonJobFeed() {
   }
 }
 
-// --- ORGANIC REQUEST JITTER (3-5 seconds like Python loop sleeps) ---
+// --- ORGANIC REQUEST JITTER (3-5 seconds) ---
 async function randomizedDelay() {
   const jitter = Math.floor(Math.random() * (5000 - 3000 + 1)) + 3000;
   await new Promise(resolve => setTimeout(resolve, jitter));
@@ -218,10 +218,19 @@ async function runScannerLoop(loopName) {
     try {
       const jobCards = await fetchAmazonJobFeed();
       
-      // Process and evaluate job cards against target UK locations locally
-      for (const job of jobCards) {
-        // Example check: pass discovered schedules to atomic handler
-        // handleDiscoveredSchedule(job.jobId, job);
+      if (jobCards && jobCards.length > 0) {
+        console.log(`[${loopName}] Fetched ${jobCards.length} job card(s) from Amazon.`);
+        for (const job of jobCards) {
+          // Actively process and pass discovered jobs to atomic handler & Telegram outbox
+          handleDiscoveredSchedule(job.jobId, {
+            jobId: job.jobId,
+            title: job.jobTitle,
+            location: job.locationName || job.city || 'UK Hub',
+            postcode: job.postalCode || 'CA6 5TR',
+            payRate: job.totalPayRateMax ? job.totalPayRateMax.toString() : '15.10',
+            employment: 'Seasonal | Full-time;Part-time'
+          });
+        }
       }
 
       await randomizedDelay();
@@ -235,7 +244,7 @@ async function runScannerLoop(loopName) {
 // --- APP INITIALIZATION ---
 console.log('[Bot] Starting Amazon Shift Tracker (Node.js High-Speed Edition)...');
 console.log('[Activation] Runtime: Node.js ES Modules | Database: better-sqlite3 | Deduplication: Atomic SQLite Lock');
-console.log('[Bot] Targets: Carlisle, Northampton, Tilbury, Dartford, Enfield, Bow / Barking, Chingford, Harlow, Exeter, Poole, Preston, Croydon, Maidstone, London, Garden City, Birmingham, Neasden, West London, Haringey, Dunfermline, Bromley, Orpington, Doncaster, Hayes');
+console.log('[Bot] Targets: Nationwide UK Feed Scans');
 console.log('[Watchdog] Started - monitoring 3 global overlapping loops with staggered delays.');
 
 startTelegramWorker();
