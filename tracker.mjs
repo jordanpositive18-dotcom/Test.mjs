@@ -67,7 +67,7 @@ function startTelegramWorker() {
 
       for (const alert of pendingAlerts) {
         if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-          console.warn('[Telegram] ⚠️ Credentials missing. Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in Railway/Replit environment variables.');
+          console.warn('[Telegram] ⚠️ Credentials missing. Check TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.');
           stmtMarkAlertFailed.run(alert.id);
           continue;
         }
@@ -103,40 +103,114 @@ function startTelegramWorker() {
   }, 1000);
 }
 
-// --- CORE DISCOVERY & ATOMIC CLAIM HANDLER ---
-function handleDiscoveredSchedule(scheduleId, jobDetails) {
-  const result = stmtClaimSchedule.run(scheduleId);
+// --- FETCH DETAILED SCHEDULE CARDS FOR A JOB ID ---
+async function fetchSchedulesForJob(jobId) {
+  const url = 'https://www.jobsatamazon.co.uk/graphql';
+  const query = `
+    query searchScheduleCards($searchScheduleRequest: SearchScheduleRequest!) {
+      searchScheduleCards(searchScheduleRequest: $searchScheduleRequest) {
+        scheduleCards {
+          scheduleId
+          jobId
+          firstDayOnSite
+          firstDayOnSiteL10N
+          scheduleText
+          scheduleType
+          hoursPerWeek
+        }
+      }
+    }
+  `;
 
-  // Atomic SQLite check: returns 1 if this loop successfully claimed it first
-  if (result.changes === 1) {
-    const location = jobDetails.location || 'UK Delivery Station';
-    const postcode = jobDetails.postcode || 'N/A';
-    const title = jobDetails.title || 'Delivery Station Warehouse Associate';
-    const shiftCount = jobDetails.shifts ? jobDetails.shifts.length : 1;
-    const employment = jobDetails.employment || 'Seasonal | Full-time;Part-time';
-    const payRate = jobDetails.payRate || '15.10';
+  const variables = {
+    searchScheduleRequest: {
+      country: 'United Kingdom',
+      jobId: jobId,
+      locale: 'en-GB',
+      pageSize: 100,
+      dateFilters: [],
+      rangeFilters: [],
+      equalFilters: [],
+      excludeFilters: [],
+      orFilters: []
+    }
+  };
 
-    let message = `📍 ${location} ${postcode}\n` +
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-GB,en;q=0.9',
+        'Origin': 'https://www.jobsatamazon.co.uk',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        ...(AMAZON_AUTH_TOKEN ? { 'Authorization': AMAZON_AUTH_TOKEN } : {})
+      },
+      body: JSON.stringify({ query, variables }),
+      ...(dispatcher ? { dispatcher } : {})
+    });
+
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data?.data?.searchScheduleCards?.scheduleCards || [];
+  } catch (err) {
+    return [];
+  }
+}
+
+// --- CORE JOB & SCHEDULE PROCESSOR ---
+async function processDiscoveredJob(job) {
+  // Fetch the real individual shift schedules for this job
+  const scheduleCards = await fetchSchedulesForJob(job.jobId);
+
+  let claimedAny = false;
+  const validSchedules = [];
+
+  if (scheduleCards && scheduleCards.length > 0) {
+    for (const card of scheduleCards) {
+      const res = stmtClaimSchedule.run(card.scheduleId);
+      if (res.changes === 1) {
+        claimedAny = true;
+      }
+      validSchedules.push(card);
+    }
+  } else {
+    // Fallback if schedule endpoint returns empty
+    const res = stmtClaimSchedule.run(job.jobId);
+    if (res.changes === 1) {
+      claimedAny = true;
+    }
+    validSchedules.push({
+      scheduleId: job.jobId,
+      firstDayOnSiteL10N: 'Upcoming',
+      scheduleText: 'Working Days Flexible',
+      hoursPerWeek: '20'
+    });
+  }
+
+  // If at least one schedule was newly claimed (atomic deduplication passed)
+  if (claimedAny) {
+    const locationName = job.locationName || job.city || 'UK Delivery Station';
+    const postalCode = job.postalCode || '';
+    const title = job.jobTitle || 'Delivery Station Warehouse Associate';
+    const payRate = job.totalPayRateMax ? job.totalPayRateMax.toString() : '15.10';
+    const shiftCount = validSchedules.length;
+
+    let message = `📍 ${locationName} ${postalCode}\n` +
                   `🏷️ ${title} | ${shiftCount}\n` +
-                  `💼 ${employment}\n` +
+                  `💼 Seasonal | Full-time;Part-time\n` +
                   `💰 £${payRate} /hr\n`;
 
-    if (jobDetails.shifts && Array.isArray(jobDetails.shifts) && jobDetails.shifts.length > 0) {
-      jobDetails.shifts.forEach((shift, index) => {
-        message += `\n📋 Shift ${index + 1}:\n` +
-                   `📅 First Day: ${shift.startDate || 'Upcoming'}\n` +
-                   `⏰ Schedule: ${shift.scheduleDays || 'Working Days'} ${shift.time || 'Flexible'}\n` +
-                   `🕐 Hours/Week: ${shift.hoursPerWeek || '20'}\n`;
-      });
-    } else {
-      message += `\n📋 Shift 1:\n` +
-                 `📅 First Day: ${jobDetails.startDate || 'Upcoming'}\n` +
-                 `⏰ Schedule: ${jobDetails.scheduleDays || 'Working Days'} ${jobDetails.time || 'Flexible'}\n` +
-                 `🕐 Hours/Week: ${jobDetails.hoursPerWeek || '20'}\n`;
-    }
+    validSchedules.forEach((shift, index) => {
+      message += `\n📋 Shift ${index + 1}:\n` +
+                 `📅 First Day: ${shift.firstDayOnSiteL10N || shift.firstDayOnSite || 'Upcoming'}\n` +
+                 `⏰ Schedule: ${shift.scheduleText || 'Working Days'}\n` +
+                 `🕐 Hours/Week: ${shift.hoursPerWeek || '20'}\n`;
+    });
 
     stmtEnqueueTelegram.run(message);
-    console.log(`[DEDUP] Claimed and queued alert for schedule/job: ${scheduleId}`);
+    console.log(`[DEDUP] Claimed and queued alert for job: ${job.jobId} (${locationName}) with ${shiftCount} shift(s)`);
   }
 }
 
@@ -221,15 +295,8 @@ async function runScannerLoop(loopName) {
       if (jobCards && jobCards.length > 0) {
         console.log(`[${loopName}] Fetched ${jobCards.length} job card(s) from Amazon.`);
         for (const job of jobCards) {
-          // Actively process and pass discovered jobs to atomic handler & Telegram outbox
-          handleDiscoveredSchedule(job.jobId, {
-            jobId: job.jobId,
-            title: job.jobTitle,
-            location: job.locationName || job.city || 'UK Hub',
-            postcode: job.postalCode || 'CA6 5TR',
-            payRate: job.totalPayRateMax ? job.totalPayRateMax.toString() : '15.10',
-            employment: 'Seasonal | Full-time;Part-time'
-          });
+          // Process each job and fetch its detailed schedules
+          await processDiscoveredJob(job);
         }
       }
 
@@ -244,7 +311,7 @@ async function runScannerLoop(loopName) {
 // --- APP INITIALIZATION ---
 console.log('[Bot] Starting Amazon Shift Tracker (Node.js High-Speed Edition)...');
 console.log('[Activation] Runtime: Node.js ES Modules | Database: better-sqlite3 | Deduplication: Atomic SQLite Lock');
-console.log('[Bot] Targets: Nationwide UK Feed Scans');
+console.log('[Bot] Targets: Nationwide UK Feed Scans with Full Schedule Card Resolution');
 console.log('[Watchdog] Started - monitoring 3 global overlapping loops with staggered delays.');
 
 startTelegramWorker();
