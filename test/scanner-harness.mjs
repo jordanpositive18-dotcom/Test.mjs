@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import vm from 'node:vm';
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'node:url';
@@ -37,6 +38,7 @@ export function createScannerHarness(t, {
   prepareDatabase = () => {},
   timeoutHandler = () => {},
   databasePath: sharedDatabasePath,
+  fileSystem = {},
   logger = { log() {}, warn() {}, error() {} },
   env = {},
 } = {}) {
@@ -57,7 +59,7 @@ export function createScannerHarness(t, {
 
   const sourcePath = fileURLToPath(new URL('../tracker.mjs', import.meta.url));
   const source = readFileSync(sourcePath, 'utf8')
-    .replace(/^import .*;\r?\n/gm, '')
+    .replace(/^import[\s\S]*?;\r?\n/gm, '')
     .split('// --- APP INITIALIZATION ---')[0]
     + `
 globalThis.__testApi = {
@@ -71,6 +73,9 @@ globalThis.__testApi = {
   includeSchedulePaginationStatus,
   protectedAmazonFetch,
   getAmazonProtectionState,
+  activateAmazonCooldown,
+  persistAmazonProtectionAtomically,
+  recoveryMarkerPath: AMAZON_PROTECTION_RECOVERY_MARKER,
 };
 `;
 
@@ -130,6 +135,16 @@ globalThis.__testApi = {
   }
 
   const context = vm.createContext({
+    closeSync: fs.closeSync,
+    existsSync: fs.existsSync,
+    fsyncSync: fs.fsyncSync,
+    openSync: fs.openSync,
+    readFileSync: fs.readFileSync,
+    renameSync: fs.renameSync,
+    unlinkSync: fs.unlinkSync,
+    writeFileSync: fs.writeFileSync,
+    dirname,
+    ...fileSystem,
     Database: TestDatabase,
     fetch: fetchMock,
     ProxyAgent: class ProxyAgent {

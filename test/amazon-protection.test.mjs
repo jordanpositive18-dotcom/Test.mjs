@@ -25,7 +25,8 @@ test('successful Amazon responses complete normally and clear the timeout resour
   assert.equal(harness.amazonCalls[0].options.signal.aborted, false);
   assert.equal(harness.requestTimeouts.length, 1);
   assert.equal(harness.requestTimeouts[0].cleared, true);
-  assert.equal(protectionRow(harness.api.db), undefined);
+  assert.equal(protectionRow(harness.api.db).reason, 'none');
+  assert.equal(harness.api.getAmazonProtectionState().blocked, false);
 });
 
 test('30-second request timeout aborts cleanly and applies the shared transient cooldown', async (t) => {
@@ -76,7 +77,7 @@ test('HTTP 429 Retry-After seconds set the same shared cooldown', async (t) => {
 
   const expiry = Date.parse(protectionRow(harness.api.db).expires_at);
   assert.equal(protectionRow(harness.api.db).reason, 'http_429');
-  assert.ok(expiry - before >= 16900 && expiry - before <= 17100);
+  assert.ok(expiry >= before + 17000 && expiry <= Date.now() + 17000);
   await harness.api.fetchSchedulesForJob('JOB-1', 'Loop-3');
   assert.equal(harness.amazonCalls.length, 1);
 });
@@ -95,16 +96,16 @@ test('HTTP 429 Retry-After HTTP-date is respected', async (t) => {
 });
 
 test('HTTP 429 without Retry-After uses the 60-second fallback', async (t) => {
-  const before = Date.now();
   const harness = createScannerHarness(t, {
     jobResponder: async () => mockResponse({}, 429),
   });
 
+  const before = Date.now();
   await harness.api.fetchAmazonJobFeed('Loop-1');
 
   const expiry = Date.parse(protectionRow(harness.api.db).expires_at);
   assert.equal(protectionRow(harness.api.db).reason, 'http_429');
-  assert.ok(expiry - before >= 59900 && expiry - before <= 60100);
+  assert.ok(expiry >= before + 60000 && expiry <= Date.now() + 60000);
 });
 
 test('HTTP 5xx applies the shared 30-second cooldown', async (t) => {
@@ -332,7 +333,8 @@ test('other HTTP errors are classified as partial without claiming scan success'
   const result = await harness.api.fetchAmazonJobFeed('Loop-1');
 
   assert.equal(result.scanStatus, 'PARTIAL');
-  assert.equal(protectionRow(harness.api.db), undefined);
+  assert.equal(protectionRow(harness.api.db).reason, 'none');
+  assert.equal(harness.api.getAmazonProtectionState().blocked, false);
   assert.equal(harness.amazonCalls.length, 1);
 });
 

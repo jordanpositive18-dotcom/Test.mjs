@@ -220,6 +220,7 @@ const activeAmazonControllers = new Set();
 let pendingProtectionWrite = null;
 let protectionStateUnavailable = false;
 let protectionStateInitialized = false;
+let allowProtectionBootstrap = !protectionTableExistedBeforeMigration;
 
 function protectionReasonPriority(reason) {
   if (reason === 'protection_state_unknown') return 100;
@@ -244,17 +245,20 @@ function normalizeProtectionRecord(record) {
 }
 
 function mergeProtectionRecords(records, now = Date.now()) {
-  const active = records
-    .map(normalizeProtectionRecord)
-    .filter((record) => record
-      && record.reason !== 'none'
-      && Date.parse(record.expires_at) > now);
-  if (active.length === 0) {
+  const valid = records.filter(Boolean).map((record) => {
+    const normalized = normalizeProtectionRecord(record);
+    if (!normalized) throw new Error('Invalid Amazon protection state');
+    return normalized;
+  });
+  if (valid.length === 0) {
     return { reason: 'none', expires_at: AMAZON_PROTECTION_CLEAR_EXPIRY };
   }
-
-  const maxExpiry = Math.max(...active.map((record) => Date.parse(record.expires_at)));
-  const strongest = active.sort((left, right) => (
+  const maxExpiry = Math.max(...valid.map((record) => Date.parse(record.expires_at)));
+  const active = valid.filter((record) => Date.parse(record.expires_at) > now);
+  const candidates = active.length ? active : valid.filter(
+    (record) => Date.parse(record.expires_at) === maxExpiry,
+  );
+  const strongest = candidates.sort((left, right) => (
     protectionReasonPriority(right.reason) - protectionReasonPriority(left.reason)
     || Date.parse(right.expires_at) - Date.parse(left.expires_at)
   ))[0];
@@ -305,6 +309,7 @@ function writeAmazonProtectionMarker(record) {
   } finally {
     closeSync(fileHandle);
   }
+  syncProtectionMarkerDirectory();
   renameSync(AMAZON_PROTECTION_RECOVERY_TEMP, AMAZON_PROTECTION_RECOVERY_MARKER);
   syncProtectionMarkerDirectory();
 }
@@ -344,8 +349,8 @@ function reconcileAmazonProtectionState() {
     const databaseState = stmtGetAmazonProtection.get();
     let records = [...markers, databaseState, pendingProtectionWrite];
 
-    if (markers.length === 0 && !databaseState) {
-      if (protectionTableExistedBeforeMigration) {
+    if (markers.length === 0 && !databaseState && !pendingProtectionWrite) {
+      if (!allowProtectionBootstrap) {
         records.push({
           reason: 'protection_state_unknown',
           expires_at: AMAZON_PROTECTION_UNKNOWN_EXPIRY,
@@ -368,6 +373,7 @@ function reconcileAmazonProtectionState() {
     pendingProtectionWrite = null;
     protectionStateUnavailable = false;
     protectionStateInitialized = true;
+    allowProtectionBootstrap = false;
     return true;
   } catch {
     protectionStateUnavailable = true;
@@ -377,6 +383,11 @@ function reconcileAmazonProtectionState() {
 }
 
 function getAmazonProtectionState() {
+  try {
+    if (readAmazonProtectionMarkers().length) protectionStateUnavailable = true;
+  } catch {
+    return { blocked: true, reason: 'protection_marker_unavailable', expiresAt: null };
+  }
   if (!protectionStateInitialized || protectionStateUnavailable || pendingProtectionWrite) {
     if (!reconcileAmazonProtectionState()) {
       return {
@@ -433,18 +444,30 @@ function activateAmazonCooldown(reason, durationMs, loopName, operation, control
 
   try {
     const markerRecords = readAmazonProtectionMarkers();
-    const databaseState = stmtGetAmazonProtection.get();
+    let databaseState;
+    try {
+      databaseState = stmtGetAmazonProtection.get();
+    } catch {
+      // Still journal the known cooldown if SQLite itself cannot be read.
+    }
     merged = mergeProtectionRecords([
       ...markerRecords,
       databaseState,
       pendingProtectionWrite,
       candidate,
     ]);
-    writeAmazonProtectionMarker(merged);
+    let markerWritten = false;
+    try {
+      writeAmazonProtectionMarker(merged);
+      markerWritten = true;
+    } catch {
+      // Still try SQLite: either durable store can preserve the cooldown.
+    }
     pendingProtectionWrite = merged;
     const persisted = persistAmazonProtectionAtomically(merged);
     merged = mergeProtectionRecords([merged, persisted]);
     stateWasPersisted = true;
+    if (!markerWritten) throw new Error('Amazon protection marker could not be written');
     clearAmazonProtectionMarkers();
     pendingProtectionWrite = null;
     protectionStateUnavailable = false;
@@ -512,21 +535,29 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
   const startedAt = Date.now();
   let timeoutHandle;
   let status = 'none';
+  const onAbort = () => rejectAborted(new Error('Amazon request aborted'));
+  let rejectAborted;
+  const aborted = new Promise((_, reject) => { rejectAborted = reject; });
+  controller.signal.addEventListener('abort', onAbort, { once: true });
   try {
+    timeoutHandle = setTimeout(() => {
+      controller.abort({ type: 'amazon-timeout' });
+    }, AMAZON_REQUEST_TIMEOUT_MS);
     const response = await Promise.race([
       fetch(url, { ...options, signal: controller.signal }),
-      new Promise((_, reject) => {
-        timeoutHandle = setTimeout(() => {
-          controller.abort({ type: 'amazon-timeout' });
-          const error = new Error('Amazon request timed out');
-          error.name = 'TimeoutError';
-          reject(error);
-        }, AMAZON_REQUEST_TIMEOUT_MS);
-      }),
+      aborted,
     ]);
     status = response.status;
+    if (controller.signal.aborted
+      && controller.signal.reason?.type !== 'amazon-shared-cooldown') {
+      throw new Error('Amazon request aborted before response acceptance');
+    }
     if (controller.signal.reason?.type === 'amazon-shared-cooldown') {
-      await response.body?.cancel?.().catch?.(() => {});
+      try {
+        await Promise.race([response.body?.cancel?.(), aborted]);
+      } catch {
+        // Discard an already-aborted response.
+      }
       const state = getAmazonProtectionState();
       console.warn(
         `[AmazonRequest] loop=${loopName} operation=${operation} status=aborted `
@@ -542,7 +573,7 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
         reason: responseProtection.reason,
       });
       try {
-        await response.body?.cancel?.();
+        await Promise.race([response.body?.cancel?.(), aborted]);
       } catch {
         // The response is discarded while the shared cooldown remains active.
       }
@@ -559,7 +590,7 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
         response.status,
       );
       try {
-        await response.body?.cancel?.();
+        await Promise.race([response.body?.cancel?.(), aborted]);
       } catch {
         // Closing an already-aborted or empty error body must not disable cooldown protection.
       }
@@ -569,7 +600,11 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
       );
       return { response, data: null };
     } else {
-      const data = response.ok ? await response.json() : null;
+      const data = response.ok ? await Promise.race([response.json(), aborted]) : null;
+      if (controller.signal.aborted
+        && controller.signal.reason?.type !== 'amazon-shared-cooldown') {
+        throw new Error('Amazon request aborted during response processing');
+      }
       if (controller.signal.reason?.type === 'amazon-shared-cooldown') {
         const state = getAmazonProtectionState();
         console.warn(
@@ -622,9 +657,13 @@ async function protectedAmazonFetch(operation, loopName, url, options) {
     throw error;
   } finally {
     if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    controller.signal.removeEventListener('abort', onAbort);
     activeAmazonControllers.delete(controller);
   }
 }
+
+// Reconcile the durable journal before any loop or Telegram worker is started.
+reconcileAmazonProtectionState();
 
 function recordTelegramFailure(alert, error) {
   const attemptCount = alert.attempt_count;
@@ -820,7 +859,7 @@ async function fetchSchedulesForJob(jobId, loopName = 'Loop-unknown') {
     };
 
     try {
-      const res = await protectedAmazonFetch('searchScheduleCards', loopName, url, {
+      const protectedResult = await protectedAmazonFetch('searchScheduleCards', loopName, url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -834,17 +873,18 @@ async function fetchSchedulesForJob(jobId, loopName = 'Loop-unknown') {
         ...(dispatcher ? { dispatcher } : {})
       });
 
-      if (!res) {
+      if (!protectedResult
+        || (protectedResult.response.ok && getAmazonProtectionState().blocked)) {
         paginationComplete = false;
         break;
       }
+      const { response: res, data } = protectedResult;
 
       if (!res.ok) {
         reportAmazonHttpFailure('schedule feed', res, pageCount, jobId);
         paginationComplete = false;
         break;
       }
-      const data = await res.json();
       const resultData = data?.data?.searchScheduleCards;
       if (resultData && resultData.scheduleCards) {
         allSchedules.push(...resultData.scheduleCards);
@@ -973,7 +1013,7 @@ async function fetchAmazonJobFeed(loopName = 'Loop-unknown') {
     };
 
     try {
-      const res = await protectedAmazonFetch('searchJobCardsByLocation', loopName, url, {
+      const protectedResult = await protectedAmazonFetch('searchJobCardsByLocation', loopName, url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -987,10 +1027,12 @@ async function fetchAmazonJobFeed(loopName = 'Loop-unknown') {
         ...(dispatcher ? { dispatcher } : {})
       });
 
-      if (!res) {
+      if (!protectedResult
+        || (protectedResult.response.ok && getAmazonProtectionState().blocked)) {
         scanStatus = 'BLOCKED';
         break;
       }
+      const { response: res, data } = protectedResult;
 
       if (res.status === 403 || res.status === 401) {
         reportAmazonHttpFailure('job feed', res, pageCount);
@@ -1004,7 +1046,6 @@ async function fetchAmazonJobFeed(loopName = 'Loop-unknown') {
         break;
       }
 
-      const data = await res.json();
       const resultData = data?.data?.searchJobCardsByLocation;
       if (resultData && resultData.jobCards) {
         for (const job of resultData.jobCards) {
