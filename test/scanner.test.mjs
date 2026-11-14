@@ -177,3 +177,85 @@ test('failed network delivery is recorded and retried only after backoff', async
   await runCycle();
   assert.equal(harness.telegramCalls.length, 1);
 });
+
+test('job discovery, queue, and Telegram timestamps are ISO 8601 and latencies parse correctly', async (t) => {
+  const logs = [];
+  const harness = createScannerHarness(t, {
+    prepareDatabase(db) {
+      db.exec(`
+        CREATE TABLE discovered_schedules (
+          schedule_id TEXT PRIMARY KEY,
+          discovered_at TEXT,
+          amazon_detected_at TEXT,
+          notification_queued_at TEXT,
+          telegram_sent_at TEXT
+        );
+        INSERT INTO discovered_schedules (
+          schedule_id, discovered_at, amazon_detected_at,
+          notification_queued_at, telegram_sent_at
+        ) VALUES (
+          'S-OLD-TIMES', '2026-11-14 12:00:00', '2026-11-14 12:00:01',
+          '2026-11-14 12:00:02', '2026-11-14 12:00:03'
+        );
+      `);
+    },
+    jobResponder: async () => mockResponse({
+      data: {
+        searchJobCardsByLocation: {
+          jobCards: [{ ...job, jobId: 'JOB-TIMESTAMP' }],
+          nextToken: null,
+        },
+      },
+    }),
+    scheduleResponder: async () => mockResponse({
+      data: {
+        searchScheduleCards: {
+          scheduleCards: [schedule('S-TIMESTAMP', 'Timestamped shift')],
+          nextToken: null,
+        },
+      },
+    }),
+    logger: {
+      log: (...values) => logs.push(values.join(' ')),
+      warn() {},
+      error() {},
+    },
+  });
+
+  const feed = await harness.api.fetchAmazonJobFeed();
+  const discoveredJob = feed.jobCards[0];
+  const detectedAt = discoveredJob._scannerDetectedAt;
+  assert.match(detectedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+  await harness.api.processDiscoveredJob(discoveredJob, detectedAt);
+
+  const detectedRecord = harness.api.db.prepare(
+    "SELECT * FROM discovered_schedules WHERE schedule_id = 'S-TIMESTAMP'",
+  ).get();
+  assert.equal(detectedRecord.discovered_at, detectedAt);
+  assert.equal(detectedRecord.amazon_detected_at, detectedAt);
+  assert.match(detectedRecord.notification_queued_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
+  harness.api.startTelegramWorker();
+  await harness.intervals[0].callback();
+  const sentRecord = harness.api.db.prepare(
+    "SELECT * FROM discovered_schedules WHERE schedule_id = 'S-TIMESTAMP'",
+  ).get();
+  assert.match(sentRecord.telegram_sent_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+
+  const detectedMs = Date.parse(sentRecord.amazon_detected_at);
+  const queuedMs = Date.parse(sentRecord.notification_queued_at);
+  const sentMs = Date.parse(sentRecord.telegram_sent_at);
+  assert.ok(queuedMs >= detectedMs);
+  assert.ok(sentMs >= queuedMs);
+  assert.ok(logs.some((line) => line.includes(
+    `Discovery->Queue: ${queuedMs - detectedMs}ms | Queue->Telegram: ${sentMs - queuedMs}ms | Total Pipeline: ${sentMs - detectedMs}ms`,
+  )));
+
+  const migrated = harness.api.db.prepare(
+    "SELECT * FROM discovered_schedules WHERE schedule_id = 'S-OLD-TIMES'",
+  ).get();
+  assert.equal(migrated.discovered_at, '2026-11-14T12:00:00.000Z');
+  assert.equal(migrated.amazon_detected_at, '2026-11-14T12:00:01.000Z');
+  assert.equal(migrated.notification_queued_at, '2026-11-14T12:00:02.000Z');
+  assert.equal(migrated.telegram_sent_at, '2026-11-14T12:00:03.000Z');
+});

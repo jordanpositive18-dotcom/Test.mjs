@@ -23,6 +23,35 @@ db.exec(`
   );
 `);
 
+// Normalize legacy SQLite UTC timestamps to ISO 8601 without changing records.
+db.exec(`
+  UPDATE discovered_schedules
+  SET discovered_at = CASE
+        WHEN discovered_at GLOB '????-??-?? ??:??:??'
+          THEN substr(discovered_at, 1, 10) || 'T' || substr(discovered_at, 12, 8) || '.000Z'
+        ELSE discovered_at
+      END,
+      amazon_detected_at = CASE
+        WHEN amazon_detected_at GLOB '????-??-?? ??:??:??'
+          THEN substr(amazon_detected_at, 1, 10) || 'T' || substr(amazon_detected_at, 12, 8) || '.000Z'
+        ELSE amazon_detected_at
+      END,
+      notification_queued_at = CASE
+        WHEN notification_queued_at GLOB '????-??-?? ??:??:??'
+          THEN substr(notification_queued_at, 1, 10) || 'T' || substr(notification_queued_at, 12, 8) || '.000Z'
+        ELSE notification_queued_at
+      END,
+      telegram_sent_at = CASE
+        WHEN telegram_sent_at GLOB '????-??-?? ??:??:??'
+          THEN substr(telegram_sent_at, 1, 10) || 'T' || substr(telegram_sent_at, 12, 8) || '.000Z'
+        ELSE telegram_sent_at
+      END
+  WHERE discovered_at GLOB '????-??-?? ??:??:??'
+     OR amazon_detected_at GLOB '????-??-?? ??:??:??'
+     OR notification_queued_at GLOB '????-??-?? ??:??:??'
+     OR telegram_sent_at GLOB '????-??-?? ??:??:??';
+`);
+
 const outboxColumns = new Set(
   db.prepare('PRAGMA table_info(telegram_outbox)').all().map(({ name }) => name),
 );
@@ -59,7 +88,7 @@ db.exec(`
 // Prepared statements for high performance & atomic safety
 const stmtClaimSchedule = db.prepare(`
   INSERT OR IGNORE INTO discovered_schedules (schedule_id, discovered_at, amazon_detected_at)
-  VALUES (?, datetime('now'), ?)
+  VALUES (?, ?, ?)
 `);
 
 const stmtUpdateQueueTime = db.prepare(`
@@ -112,7 +141,7 @@ const stmtMarkAlertFailed = db.prepare(`
 `);
 
 const stmtUpdateSentTime = db.prepare(`
-  UPDATE discovered_schedules SET telegram_sent_at = datetime('now') WHERE schedule_id = ?
+  UPDATE discovered_schedules SET telegram_sent_at = ? WHERE schedule_id = ?
 `);
 
 const stmtGetTelemetryTimestamps = db.prepare(`
@@ -196,6 +225,7 @@ async function runTelegramWorkerCycle() {
         }
 
         stmtMarkAlertSent.run(alert.id);
+        const sentAt = new Date().toISOString();
         let scheduleIds = [];
         try {
           scheduleIds = JSON.parse(alert.schedule_ids || '[]');
@@ -203,7 +233,7 @@ async function runTelegramWorkerCycle() {
           scheduleIds = alert.schedule_id ? [alert.schedule_id] : [];
         }
         for (const scheduleId of scheduleIds) {
-          stmtUpdateSentTime.run(scheduleId);
+          stmtUpdateSentTime.run(sentAt, scheduleId);
           const row = stmtGetTelemetryTimestamps.get(scheduleId);
           if (row?.amazon_detected_at && row?.notification_queued_at && row?.telegram_sent_at) {
             const tAmazon = new Date(row.amazon_detected_at).getTime();
@@ -325,7 +355,7 @@ async function processDiscoveredJob(job, amazonDetectedAt) {
     const newlyDiscovered = [];
     for (const card of scheduleCards) {
       if (!card?.scheduleId) continue;
-      const result = stmtClaimSchedule.run(card.scheduleId, amazonDetectedAt);
+      const result = stmtClaimSchedule.run(card.scheduleId, amazonDetectedAt, amazonDetectedAt);
       if (result.changes === 1) newlyDiscovered.push(card);
     }
 
@@ -447,7 +477,12 @@ async function fetchAmazonJobFeed() {
       const data = await res.json();
       const resultData = data?.data?.searchJobCardsByLocation;
       if (resultData && resultData.jobCards) {
-        allJobCards.push(...resultData.jobCards);
+        for (const job of resultData.jobCards) {
+          allJobCards.push({
+            ...job,
+            _scannerDetectedAt: new Date().toISOString(),
+          });
+        }
       }
 
       nextToken = resultData?.nextToken || null;
@@ -478,13 +513,12 @@ async function runScannerLoop(loopName) {
 
   while (true) {
     try {
-      const amazonDetectedAt = new Date().toISOString();
       const { jobCards, scanStatus } = await fetchAmazonJobFeed();
       let completedScanStatus = scanStatus;
 
       if (scanStatus !== 'BLOCKED' && jobCards && jobCards.length > 0) {
         for (const job of jobCards) {
-          const result = await processDiscoveredJob(job, amazonDetectedAt);
+          const result = await processDiscoveredJob(job, job._scannerDetectedAt);
           completedScanStatus = includeSchedulePaginationStatus(
             completedScanStatus,
             result.paginationComplete,
