@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import vm from 'node:vm';
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'node:url';
@@ -36,11 +37,13 @@ export function createScannerHarness(t, {
   telegramResponder = async () => mockResponse({ ok: true }),
   prepareDatabase = () => {},
   timeoutHandler = () => {},
+  databasePath: sharedDatabasePath,
+  fileSystem = {},
   logger = { log() {}, warn() {}, error() {} },
   env = {},
 } = {}) {
-  const directory = mkdtempSync(join(tmpdir(), 'amazon-restored-scanner-'));
-  const databasePath = join(directory, 'test.sqlite');
+  const ownedDirectory = sharedDatabasePath ? null : mkdtempSync(join(tmpdir(), 'amazon-restored-scanner-'));
+  const databasePath = sharedDatabasePath ?? join(ownedDirectory, 'test.sqlite');
   if (prepareDatabase) {
     const existingDatabase = new Database(databasePath);
     prepareDatabase(existingDatabase);
@@ -50,12 +53,13 @@ export function createScannerHarness(t, {
   const telegramCalls = [];
   const intervals = [];
   const delays = [];
+  const requestTimeouts = [];
   let scheduleCallCount = 0;
   let jobCallCount = 0;
 
   const sourcePath = fileURLToPath(new URL('../tracker.mjs', import.meta.url));
   const source = readFileSync(sourcePath, 'utf8')
-    .replace(/^import .*;\r?\n/gm, '')
+    .replace(/^import[\s\S]*?;\r?\n/gm, '')
     .split('// --- APP INITIALIZATION ---')[0]
     + `
 globalThis.__testApi = {
@@ -67,14 +71,25 @@ globalThis.__testApi = {
   runTelegramWorkerCycle,
   startTelegramWorker,
   includeSchedulePaginationStatus,
+  protectedAmazonFetch,
+  getAmazonProtectionState,
+  activateAmazonCooldown,
+  persistAmazonProtectionAtomically,
+  recoveryMarkerPath: AMAZON_PROTECTION_RECOVERY_MARKER,
 };
 `;
+
+  const signalError = (signal) => {
+    const error = signal.reason instanceof Error ? signal.reason : new Error('Mock request aborted');
+    error.name = error.name === 'Error' ? 'AbortError' : error.name;
+    return error;
+  };
 
   const fetchMock = async (url, options = {}) => {
     if (url.includes('api.telegram.org')) {
       const call = { url, options, body: JSON.parse(options.body) };
       telegramCalls.push(call);
-      return telegramResponder(call);
+      return withAbortSignal(telegramResponder(call), options.signal);
     }
 
     const body = JSON.parse(options.body);
@@ -82,14 +97,36 @@ globalThis.__testApi = {
     amazonCalls.push(call);
     if (body.query.includes('query searchScheduleCards(')) {
       scheduleCallCount += 1;
-      return scheduleResponder(call, scheduleCallCount);
+      return withAbortSignal(scheduleResponder(call, scheduleCallCount), options.signal);
     }
     if (body.query.includes('query searchJobCardsByLocation(')) {
       jobCallCount += 1;
-      return jobResponder(call, jobCallCount);
+      return withAbortSignal(jobResponder(call, jobCallCount), options.signal);
     }
     throw new Error('Unexpected mocked Amazon query');
   };
+
+  function withAbortSignal(responsePromise, signal) {
+    if (!signal) return responsePromise;
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(signalError(signal));
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
+      Promise.resolve(responsePromise).then(
+        (response) => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(response);
+        },
+        (error) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
 
   class TestDatabase extends Database {
     constructor() {
@@ -98,6 +135,16 @@ globalThis.__testApi = {
   }
 
   const context = vm.createContext({
+    closeSync: fs.closeSync,
+    existsSync: fs.existsSync,
+    fsyncSync: fs.fsyncSync,
+    openSync: fs.openSync,
+    readFileSync: fs.readFileSync,
+    renameSync: fs.renameSync,
+    unlinkSync: fs.unlinkSync,
+    writeFileSync: fs.writeFileSync,
+    dirname,
+    ...fileSystem,
     Database: TestDatabase,
     fetch: fetchMock,
     ProxyAgent: class ProxyAgent {
@@ -117,29 +164,38 @@ globalThis.__testApi = {
       intervals.push({ callback, milliseconds });
       return intervals.length;
     },
+    clearInterval() {},
+    AbortController,
+    Promise,
+    Date,
+    Math,
+    JSON,
+    clearTimeout(handle) {
+      const timeout = requestTimeouts[handle - 1];
+      if (timeout) timeout.cleared = true;
+    },
     setTimeout(callback, milliseconds) {
+      if (milliseconds === 30000) {
+        requestTimeouts.push({ callback, milliseconds, cleared: false });
+        return requestTimeouts.length;
+      }
       delays.push(milliseconds);
       timeoutHandler(milliseconds);
       queueMicrotask(callback);
       return delays.length;
     },
-    clearInterval() {},
-    Promise,
-    Date,
-    Math,
-    JSON,
   });
 
   try {
     vm.runInContext(source, context, { filename: 'tracker.mjs' });
   } catch (error) {
-    rmSync(directory, { recursive: true, force: true });
+    if (ownedDirectory) rmSync(ownedDirectory, { recursive: true, force: true });
     throw error;
   }
   const api = context.__testApi;
   t.after(() => {
-    api.db.close();
-    rmSync(directory, { recursive: true, force: true });
+    if (api.db.open) api.db.close();
+    if (ownedDirectory) rmSync(ownedDirectory, { recursive: true, force: true });
   });
 
   return {
@@ -148,6 +204,7 @@ globalThis.__testApi = {
     telegramCalls,
     intervals,
     delays,
+    requestTimeouts,
     databasePath,
   };
 }

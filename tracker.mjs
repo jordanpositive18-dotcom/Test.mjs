@@ -1,8 +1,23 @@
 import Database from 'better-sqlite3';
 import { fetch, ProxyAgent } from 'undici';
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname } from 'node:path';
 
 // Initialize SQLite database (persisted on Railway volume or local file)
 const db = new Database('shift_tracker.db');
+const protectionTableExistedBeforeMigration = Boolean(db.prepare(`
+  SELECT 1 AS present FROM sqlite_master
+  WHERE type = 'table' AND name = 'amazon_request_protection'
+`).get());
 
 // Existing schedule records are preserved; outbox columns are additive migrations.
 db.exec(`
@@ -20,6 +35,13 @@ db.exec(`
     message TEXT NOT NULL,
     status TEXT DEFAULT 'pending',
     created_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS amazon_request_protection (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    reason TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
   );
 `);
 
@@ -149,6 +171,21 @@ const stmtGetTelemetryTimestamps = db.prepare(`
   FROM discovered_schedules WHERE schedule_id = ?
 `);
 
+const stmtGetAmazonProtection = db.prepare(`
+  SELECT reason, expires_at
+  FROM amazon_request_protection
+  WHERE id = 1
+`);
+
+const stmtSetAmazonProtection = db.prepare(`
+  INSERT INTO amazon_request_protection (id, reason, expires_at, updated_at)
+  VALUES (1, ?, ?, ?)
+  ON CONFLICT(id) DO UPDATE SET
+    reason = excluded.reason,
+    expires_at = excluded.expires_at,
+    updated_at = excluded.updated_at
+`);
+
 // Configuration from environment variables
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -170,6 +207,486 @@ let telegramWorkerRunning = false;
 const TELEGRAM_MAX_ATTEMPTS = 3;
 const TELEGRAM_RETRY_BASE_MS = 5000;
 const TELEGRAM_RETRY_MAX_MS = 60000;
+const AMAZON_REQUEST_TIMEOUT_MS = 30000;
+const AMAZON_403_COOLDOWN_MS = 15 * 60 * 1000;
+const AMAZON_429_FALLBACK_COOLDOWN_MS = 60 * 1000;
+const AMAZON_TRANSIENT_COOLDOWN_MS = 30 * 1000;
+const AMAZON_AUTH_COOLDOWN_MS = 15 * 60 * 1000;
+const AMAZON_PROTECTION_RECOVERY_MARKER = `${db.name}.amazon-protection-recovery.json`;
+const AMAZON_PROTECTION_RECOVERY_TEMP = `${AMAZON_PROTECTION_RECOVERY_MARKER}.tmp`;
+const AMAZON_PROTECTION_UNKNOWN_EXPIRY = '9999-12-31T23:59:59.999Z';
+const AMAZON_PROTECTION_CLEAR_EXPIRY = '1970-01-01T00:00:00.000Z';
+const activeAmazonControllers = new Set();
+let pendingProtectionWrite = null;
+let protectionStateUnavailable = false;
+let protectionStateInitialized = false;
+let allowProtectionBootstrap = !protectionTableExistedBeforeMigration;
+
+function protectionReasonPriority(reason) {
+  if (reason === 'protection_state_unknown') return 100;
+  if (reason === 'http_403') return 90;
+  if (reason === 'http_401_authentication') return 80;
+  if (reason === 'http_429') return 70;
+  if (reason.startsWith('http_5')) return 60;
+  if (reason === 'request_timeout' || reason === 'network_error') return 50;
+  return reason === 'none' ? 0 : 40;
+}
+
+function normalizeProtectionRecord(record) {
+  if (!record || typeof record.reason !== 'string' || typeof record.expires_at !== 'string') {
+    return null;
+  }
+  const expiryMs = Date.parse(record.expires_at);
+  if (!Number.isFinite(expiryMs)) return null;
+  return {
+    reason: record.reason,
+    expires_at: new Date(expiryMs).toISOString(),
+  };
+}
+
+function mergeProtectionRecords(records, now = Date.now()) {
+  const valid = records.filter(Boolean).map((record) => {
+    const normalized = normalizeProtectionRecord(record);
+    if (!normalized) throw new Error('Invalid Amazon protection state');
+    return normalized;
+  });
+  if (valid.length === 0) {
+    return { reason: 'none', expires_at: AMAZON_PROTECTION_CLEAR_EXPIRY };
+  }
+  const maxExpiry = Math.max(...valid.map((record) => Date.parse(record.expires_at)));
+  const active = valid.filter((record) => Date.parse(record.expires_at) > now);
+  const candidates = active.length ? active : valid.filter(
+    (record) => Date.parse(record.expires_at) === maxExpiry,
+  );
+  const strongest = candidates.sort((left, right) => (
+    protectionReasonPriority(right.reason) - protectionReasonPriority(left.reason)
+    || Date.parse(right.expires_at) - Date.parse(left.expires_at)
+  ))[0];
+  return {
+    reason: strongest.reason,
+    expires_at: new Date(maxExpiry).toISOString(),
+  };
+}
+
+function readAmazonProtectionMarkers() {
+  const records = [];
+  for (const path of [AMAZON_PROTECTION_RECOVERY_MARKER, AMAZON_PROTECTION_RECOVERY_TEMP]) {
+    if (!existsSync(path)) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(path, 'utf8'));
+    } catch {
+      throw new Error('Amazon protection recovery marker is unreadable');
+    }
+    const record = normalizeProtectionRecord(parsed);
+    if (parsed?.version !== 1 || !record) {
+      throw new Error('Amazon protection recovery marker is invalid');
+    }
+    records.push(record);
+  }
+  return records;
+}
+
+function syncProtectionMarkerDirectory() {
+  const directoryHandle = openSync(dirname(AMAZON_PROTECTION_RECOVERY_MARKER), 'r');
+  try {
+    fsyncSync(directoryHandle);
+  } finally {
+    closeSync(directoryHandle);
+  }
+}
+
+function writeAmazonProtectionMarker(record) {
+  const fileHandle = openSync(AMAZON_PROTECTION_RECOVERY_TEMP, 'w', 0o600);
+  try {
+    writeFileSync(fileHandle, JSON.stringify({
+      version: 1,
+      reason: record.reason,
+      expires_at: record.expires_at,
+      updated_at: new Date().toISOString(),
+    }));
+    fsyncSync(fileHandle);
+  } finally {
+    closeSync(fileHandle);
+  }
+  syncProtectionMarkerDirectory();
+  renameSync(AMAZON_PROTECTION_RECOVERY_TEMP, AMAZON_PROTECTION_RECOVERY_MARKER);
+  syncProtectionMarkerDirectory();
+}
+
+function clearAmazonProtectionMarkers() {
+  let changed = false;
+  for (const path of [AMAZON_PROTECTION_RECOVERY_MARKER, AMAZON_PROTECTION_RECOVERY_TEMP]) {
+    if (existsSync(path)) {
+      unlinkSync(path);
+      changed = true;
+    }
+  }
+  if (changed) syncProtectionMarkerDirectory();
+}
+
+function persistAmazonProtectionAtomically(candidate) {
+  // The scanner uses one Node process. BEGIN IMMEDIATE also serializes state updates
+  // if another process accidentally shares this SQLite database.
+  return db.transaction(() => {
+    const existing = stmtGetAmazonProtection.get();
+    const merged = mergeProtectionRecords([existing, candidate]);
+    stmtSetAmazonProtection.run(merged.reason, merged.expires_at, new Date().toISOString());
+    const saved = stmtGetAmazonProtection.get();
+    const normalizedSaved = normalizeProtectionRecord(saved);
+    if (!normalizedSaved
+      || Date.parse(normalizedSaved.expires_at) < Date.parse(merged.expires_at)
+      || protectionReasonPriority(normalizedSaved.reason) < protectionReasonPriority(merged.reason)) {
+      throw new Error('Amazon cooldown state did not persist safely');
+    }
+    return normalizedSaved;
+  }).immediate();
+}
+
+function reconcileAmazonProtectionState() {
+  try {
+    const markers = readAmazonProtectionMarkers();
+    const databaseState = stmtGetAmazonProtection.get();
+    let records = [...markers, databaseState, pendingProtectionWrite];
+
+    if (markers.length === 0 && !databaseState && !pendingProtectionWrite) {
+      if (!allowProtectionBootstrap) {
+        records.push({
+          reason: 'protection_state_unknown',
+          expires_at: AMAZON_PROTECTION_UNKNOWN_EXPIRY,
+        });
+      } else {
+        records.push({ reason: 'none', expires_at: AMAZON_PROTECTION_CLEAR_EXPIRY });
+      }
+    }
+
+    const merged = mergeProtectionRecords(records);
+    if (markers.length === 0 || pendingProtectionWrite) {
+      writeAmazonProtectionMarker(merged);
+    }
+    const persisted = persistAmazonProtectionAtomically(merged);
+    if (Date.parse(persisted.expires_at) < Date.parse(merged.expires_at)
+      || protectionReasonPriority(persisted.reason) < protectionReasonPriority(merged.reason)) {
+      throw new Error('Amazon cooldown reconciliation was incomplete');
+    }
+    clearAmazonProtectionMarkers();
+    pendingProtectionWrite = null;
+    protectionStateUnavailable = false;
+    protectionStateInitialized = true;
+    allowProtectionBootstrap = false;
+    return true;
+  } catch {
+    protectionStateUnavailable = true;
+    protectionStateInitialized = false;
+    return false;
+  }
+}
+
+function getAmazonProtectionState() {
+  try {
+    if (readAmazonProtectionMarkers().length) protectionStateUnavailable = true;
+  } catch {
+    return { blocked: true, reason: 'protection_marker_unavailable', expiresAt: null };
+  }
+  if (!protectionStateInitialized || protectionStateUnavailable || pendingProtectionWrite) {
+    if (!reconcileAmazonProtectionState()) {
+      return {
+        blocked: true,
+        reason: 'protection_state_unavailable',
+        expiresAt: null,
+      };
+    }
+  }
+
+  try {
+    const state = stmtGetAmazonProtection.get();
+    const normalized = normalizeProtectionRecord(state);
+    if (!normalized) {
+      protectionStateUnavailable = true;
+      return {
+        blocked: true,
+        reason: 'protection_state_missing',
+        expiresAt: null,
+      };
+    }
+    const expiresAtMs = Date.parse(normalized.expires_at);
+    return {
+      blocked: normalized.reason !== 'none' && expiresAtMs > Date.now(),
+      reason: normalized.reason === 'none' ? null : normalized.reason,
+      expiresAt: normalized.expires_at,
+    };
+  } catch {
+    protectionStateUnavailable = true;
+    return {
+      blocked: true,
+      reason: 'protection_state_unavailable',
+      expiresAt: null,
+    };
+  }
+}
+
+function abortOtherAmazonRequests(exceptController, reason) {
+  for (const controller of activeAmazonControllers) {
+    if (controller !== exceptController) {
+      controller.abort({ type: 'amazon-shared-cooldown', reason });
+    }
+  }
+}
+
+function activateAmazonCooldown(reason, durationMs, loopName, operation, controller, status = 'none') {
+  const now = Date.now();
+  const candidate = {
+    reason,
+    expires_at: new Date(now + durationMs).toISOString(),
+  };
+  let merged = mergeProtectionRecords([pendingProtectionWrite, candidate]);
+  let stateWasPersisted = false;
+
+  try {
+    const markerRecords = readAmazonProtectionMarkers();
+    // Journal the failure using every durable/in-memory value known without
+    // consulting SQLite. A failed SQLite read must not erase this response.
+    merged = mergeProtectionRecords([
+      ...markerRecords,
+      pendingProtectionWrite,
+      candidate,
+    ]);
+    let markerWritten = false;
+    try {
+      writeAmazonProtectionMarker(merged);
+      markerWritten = true;
+    } catch {
+      // Continue to SQLite; either durable store may still preserve the cooldown.
+    }
+    pendingProtectionWrite = merged;
+
+    let databaseState;
+    try {
+      databaseState = stmtGetAmazonProtection.get();
+    } catch {
+      // The marker already contains the received failure and remains on disk.
+    }
+
+    if (databaseState) {
+      merged = mergeProtectionRecords([
+        ...markerRecords,
+        databaseState,
+        pendingProtectionWrite,
+        candidate,
+      ]);
+      try {
+        writeAmazonProtectionMarker(merged);
+        markerWritten = true;
+      } catch {
+        // Keep the previously written marker and fail closed after the DB attempt.
+        markerWritten = false;
+      }
+      pendingProtectionWrite = merged;
+    }
+
+    const persisted = persistAmazonProtectionAtomically(merged);
+    merged = mergeProtectionRecords([merged, persisted]);
+    stateWasPersisted = true;
+    if (!markerWritten) throw new Error('Amazon protection marker could not be written');
+    clearAmazonProtectionMarkers();
+    pendingProtectionWrite = null;
+    protectionStateUnavailable = false;
+    protectionStateInitialized = true;
+  } catch {
+    pendingProtectionWrite = mergeProtectionRecords([pendingProtectionWrite, merged, candidate]);
+    protectionStateUnavailable = true;
+    protectionStateInitialized = false;
+  }
+
+  abortOtherAmazonRequests(controller, reason);
+  const expiry = merged.expires_at;
+  console.warn(
+    `[AmazonRequest] loop=${loopName} operation=${operation} status=${status} `
+    + `cooldownReason=${merged.reason} cooldownExpiresAt=${expiry} `
+    + `persisted=${stateWasPersisted}`,
+  );
+  return expiry;
+}
+
+function parseRetryAfterMs(response, now = Date.now()) {
+  const value = response?.headers?.get?.('retry-after');
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  const trimmed = value.trim();
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    return Math.max(0, Math.ceil(Number(trimmed) * 1000));
+  }
+  const dateMs = Date.parse(trimmed);
+  if (!Number.isFinite(dateMs)) return null;
+  return Math.max(0, dateMs - now);
+}
+
+function amazonFailureCooldown(response) {
+  if (response.status === 403) {
+    return { reason: 'http_403', durationMs: AMAZON_403_COOLDOWN_MS };
+  }
+  if (response.status === 429) {
+    return {
+      reason: 'http_429',
+      durationMs: parseRetryAfterMs(response) ?? AMAZON_429_FALLBACK_COOLDOWN_MS,
+    };
+  }
+  if (response.status === 401) {
+    return { reason: 'http_401_authentication', durationMs: AMAZON_AUTH_COOLDOWN_MS };
+  }
+  if (response.status >= 500) {
+    return { reason: `http_${response.status}`, durationMs: AMAZON_TRANSIENT_COOLDOWN_MS };
+  }
+  return null;
+}
+
+async function protectedAmazonFetch(operation, loopName, url, options) {
+  const before = getAmazonProtectionState();
+  if (before.blocked) {
+    console.warn(
+      `[AmazonRequest] loop=${loopName} operation=${operation} status=none durationMs=0 `
+      + `cooldownReason=${before.reason} cooldownExpiresAt=${before.expiresAt ?? 'unknown'} `
+      + `scan=BLOCKED`,
+    );
+    return null;
+  }
+
+  const controller = new AbortController();
+  activeAmazonControllers.add(controller);
+  const startedAt = Date.now();
+  let timeoutHandle;
+  let status = 'none';
+  const onAbort = () => rejectAborted(new Error('Amazon request aborted'));
+  let rejectAborted;
+  const aborted = new Promise((_, reject) => { rejectAborted = reject; });
+  controller.signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    timeoutHandle = setTimeout(() => {
+      controller.abort({ type: 'amazon-timeout' });
+    }, AMAZON_REQUEST_TIMEOUT_MS);
+    const response = await Promise.race([
+      fetch(url, { ...options, signal: controller.signal }),
+      aborted,
+    ]);
+    status = response.status;
+    const cooldown = !response.ok ? amazonFailureCooldown(response) : null;
+    if (cooldown) {
+      const expiry = activateAmazonCooldown(
+        cooldown.reason,
+        cooldown.durationMs,
+        loopName,
+        operation,
+        controller,
+        response.status,
+      );
+      try {
+        await Promise.race([response.body?.cancel?.(), aborted]);
+      } catch {
+        // Closing an already-aborted or empty error body must not disable protection.
+      }
+      console.warn(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=${response.status} `
+        + `durationMs=${Date.now() - startedAt} cooldownExpiresAt=${expiry} scan=BLOCKED`,
+      );
+      return { response, data: null };
+    }
+
+    if (controller.signal.aborted
+      && controller.signal.reason?.type !== 'amazon-shared-cooldown') {
+      throw new Error('Amazon request aborted before response acceptance');
+    }
+    if (controller.signal.reason?.type === 'amazon-shared-cooldown') {
+      try {
+        await Promise.race([response.body?.cancel?.(), aborted]);
+      } catch {
+        // Discard an already-aborted response.
+      }
+      const state = getAmazonProtectionState();
+      console.warn(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=aborted `
+        + `durationMs=${Date.now() - startedAt} cooldownReason=${state.reason ?? 'shared_cooldown'} `
+        + `cooldownExpiresAt=${state.expiresAt ?? 'unknown'} scan=BLOCKED`,
+      );
+      return null;
+    }
+
+    const responseProtection = getAmazonProtectionState();
+    if (responseProtection.blocked) {
+      controller.abort({
+        type: 'amazon-shared-cooldown',
+        reason: responseProtection.reason,
+      });
+      try {
+        await Promise.race([response.body?.cancel?.(), aborted]);
+      } catch {
+        // The response is discarded while the shared cooldown remains active.
+      }
+      return null;
+    }
+    {
+      const data = response.ok ? await Promise.race([response.json(), aborted]) : null;
+      if (controller.signal.aborted
+        && controller.signal.reason?.type !== 'amazon-shared-cooldown') {
+        throw new Error('Amazon request aborted during response processing');
+      }
+      if (controller.signal.reason?.type === 'amazon-shared-cooldown') {
+        const state = getAmazonProtectionState();
+        console.warn(
+          `[AmazonRequest] loop=${loopName} operation=${operation} status=aborted `
+          + `durationMs=${Date.now() - startedAt} cooldownReason=${state.reason ?? 'shared_cooldown'} `
+          + `cooldownExpiresAt=${state.expiresAt ?? 'unknown'} scan=BLOCKED`,
+        );
+        return null;
+      }
+      const afterBodyProtection = getAmazonProtectionState();
+      if (afterBodyProtection.blocked) {
+        controller.abort({
+          type: 'amazon-shared-cooldown',
+          reason: afterBodyProtection.reason,
+        });
+        return null;
+      }
+      console.log(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=${response.status} `
+        + `durationMs=${Date.now() - startedAt} scan=${response.ok ? 'REQUEST_OK' : 'PARTIAL'}`,
+      );
+      return { response, data };
+    }
+  } catch (error) {
+    if (controller.signal.reason?.type === 'amazon-shared-cooldown') {
+      const state = getAmazonProtectionState();
+      console.warn(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=aborted `
+        + `durationMs=${Date.now() - startedAt} cooldownReason=${state.reason ?? 'shared_cooldown'} `
+        + `cooldownExpiresAt=${state.expiresAt ?? 'unknown'} scan=BLOCKED`,
+      );
+      return null;
+    }
+
+    const timedOut = controller.signal.reason?.type === 'amazon-timeout';
+    const reason = timedOut ? 'request_timeout' : 'network_error';
+    const expiry = activateAmazonCooldown(
+      reason,
+      AMAZON_TRANSIENT_COOLDOWN_MS,
+      loopName,
+      operation,
+      controller,
+      status,
+    );
+    console.error(
+      `[AmazonRequest] loop=${loopName} operation=${operation} status=${status} `
+      + `errorCategory=${reason} durationMs=${Date.now() - startedAt} `
+      + `cooldownExpiresAt=${expiry} scan=PARTIAL`,
+    );
+    throw error;
+  } finally {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    controller.signal.removeEventListener('abort', onAbort);
+    activeAmazonControllers.delete(controller);
+  }
+}
+
+// Reconcile the durable journal before any loop or Telegram worker is started.
+reconcileAmazonProtectionState();
 
 function recordTelegramFailure(alert, error) {
   const attemptCount = alert.attempt_count;
@@ -310,6 +827,8 @@ function reportAmazonHttpFailure(operation, response, pageCount, jobId) {
 
   if (response.status === 403) {
     console.warn(`[Scan Health] BLOCKED: Amazon HTTP 403 on ${context}.`);
+  } else if (response.status === 401) {
+    console.warn(`[Scan Health] BLOCKED: Amazon HTTP 401 authentication failure on ${context}.`);
   } else if (response.status === 429) {
     console.warn(`[Scan Health] THROTTLED: Amazon HTTP 429 on ${context}.${retryAfter}`);
   } else {
@@ -320,7 +839,7 @@ function reportAmazonHttpFailure(operation, response, pageCount, jobId) {
 }
 
 // --- FETCH SCHEDULE CARDS WITH FULL PAGINATION (`nextToken` Crawler) ---
-async function fetchSchedulesForJob(jobId) {
+async function fetchSchedulesForJob(jobId, loopName = 'Loop-unknown') {
   let allSchedules = [];
   let nextToken = null;
   let pageCount = 0;
@@ -363,7 +882,7 @@ async function fetchSchedulesForJob(jobId) {
     };
 
     try {
-      const res = await fetch(url, {
+      const protectedResult = await protectedAmazonFetch('searchScheduleCards', loopName, url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -377,12 +896,18 @@ async function fetchSchedulesForJob(jobId) {
         ...(dispatcher ? { dispatcher } : {})
       });
 
+      if (!protectedResult
+        || (protectedResult.response.ok && getAmazonProtectionState().blocked)) {
+        paginationComplete = false;
+        break;
+      }
+      const { response: res, data } = protectedResult;
+
       if (!res.ok) {
         reportAmazonHttpFailure('schedule feed', res, pageCount, jobId);
         paginationComplete = false;
         break;
       }
-      const data = await res.json();
       const resultData = data?.data?.searchScheduleCards;
       if (resultData && resultData.scheduleCards) {
         allSchedules.push(...resultData.scheduleCards);
@@ -412,8 +937,8 @@ async function fetchSchedulesForJob(jobId) {
 }
 
 // --- CORE JOB & SCHEDULE PROCESSOR ---
-async function processDiscoveredJob(job, amazonDetectedAt) {
-  const { schedules: scheduleCards, paginationComplete } = await fetchSchedulesForJob(job.jobId);
+async function processDiscoveredJob(job, amazonDetectedAt, loopName = 'Loop-unknown') {
+  const { schedules: scheduleCards, paginationComplete } = await fetchSchedulesForJob(job.jobId, loopName);
   const queued = db.transaction(() => {
     const newlyDiscovered = [];
     for (const card of scheduleCards) {
@@ -466,7 +991,7 @@ async function processDiscoveredJob(job, amazonDetectedAt) {
 }
 
 // --- FULL NATIONWIDE FEED FETCHER WITH PAGINATION & SCAN HEALTH TRACKING ---
-async function fetchAmazonJobFeed() {
+async function fetchAmazonJobFeed(loopName = 'Loop-unknown') {
   let allJobCards = [];
   let nextToken = null;
   let pageCount = 0;
@@ -511,7 +1036,7 @@ async function fetchAmazonJobFeed() {
     };
 
     try {
-      const res = await fetch(url, {
+      const protectedResult = await protectedAmazonFetch('searchJobCardsByLocation', loopName, url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -525,7 +1050,14 @@ async function fetchAmazonJobFeed() {
         ...(dispatcher ? { dispatcher } : {})
       });
 
-      if (res.status === 403) {
+      if (!protectedResult
+        || (protectedResult.response.ok && getAmazonProtectionState().blocked)) {
+        scanStatus = 'BLOCKED';
+        break;
+      }
+      const { response: res, data } = protectedResult;
+
+      if (res.status === 403 || res.status === 401) {
         reportAmazonHttpFailure('job feed', res, pageCount);
         scanStatus = 'BLOCKED';
         break;
@@ -537,7 +1069,6 @@ async function fetchAmazonJobFeed() {
         break;
       }
 
-      const data = await res.json();
       const resultData = data?.data?.searchJobCardsByLocation;
       if (resultData && resultData.jobCards) {
         for (const job of resultData.jobCards) {
@@ -583,12 +1114,12 @@ async function runScannerLoop(loopName) {
 
   while (true) {
     try {
-      const { jobCards, scanStatus } = await fetchAmazonJobFeed();
+      const { jobCards, scanStatus } = await fetchAmazonJobFeed(loopName);
       let completedScanStatus = scanStatus;
 
       if (scanStatus !== 'BLOCKED' && jobCards && jobCards.length > 0) {
         for (const job of jobCards) {
-          const result = await processDiscoveredJob(job, job._scannerDetectedAt);
+          const result = await processDiscoveredJob(job, job._scannerDetectedAt, loopName);
           completedScanStatus = includeSchedulePaginationStatus(
             completedScanStatus,
             result.paginationComplete,
