@@ -18,7 +18,7 @@ const schedule = (scheduleId, scheduleText) => ({
   hoursPerWeek: '30',
 });
 
-test('only newly inserted schedule IDs enter one grouped Telegram alert', async (t) => {
+test('only newly inserted schedule IDs enter the individual Telegram outbox', async (t) => {
   const harness = createScannerHarness(t, {
     scheduleResponder: async () => mockResponse({
       data: {
@@ -55,8 +55,9 @@ test('only newly inserted schedule IDs enter one grouped Telegram alert', async 
   assert.deepEqual(JSON.parse(alert.schedule_ids), ['S-NEW']);
   assert.match(alert.message, /New shift/);
   assert.doesNotMatch(alert.message, /Existing shift/);
-  assert.equal((alert.message.match(/📋 Shift 1:/g) ?? []).length, 1);
-  assert.equal((alert.message.match(/📋 Shift 2:/g) ?? []).length, 0);
+  assert.match(alert.message, /Amazon Shift Alert/);
+  assert.match(alert.message, /https:\/\/www\.jobsatamazon\.co\.uk\/app#\/jobDetail\?jobId=JOB-1/);
+  assert.equal(alert.notification_key, 'S-NEW');
 
   const uniqueIndex = db.prepare(`
     PRAGMA index_list('telegram_outbox')
@@ -64,7 +65,7 @@ test('only newly inserted schedule IDs enter one grouped Telegram alert', async 
   assert.equal(uniqueIndex?.unique, 1);
 });
 
-test('multiple new schedules produce one grouped message, not one copy per schedule', async (t) => {
+test('multiple new schedules create one detailed message per schedule', async (t) => {
   const harness = createScannerHarness(t, {
     scheduleResponder: async () => mockResponse({
       data: {
@@ -77,13 +78,52 @@ test('multiple new schedules produce one grouped message, not one copy per sched
   });
 
   const result = await harness.api.processDiscoveredJob(job, new Date().toISOString());
-  const alerts = harness.api.db.prepare('SELECT * FROM telegram_outbox').all();
+  const alerts = harness.api.db.prepare('SELECT * FROM telegram_outbox ORDER BY id').all();
 
   assert.equal(result.count, 2);
+  assert.equal(alerts.length, 2);
+  assert.deepEqual(alerts.map((alert) => alert.schedule_id), ['S-1', 'S-2']);
+  assert.deepEqual(alerts.map((alert) => JSON.parse(alert.schedule_ids)), [['S-1'], ['S-2']]);
+  assert.ok(alerts.every((alert) => alert.message.includes('Amazon Shift Alert')));
+  assert.ok(alerts.every((alert) => alert.message.includes('https://www.jobsatamazon.co.uk/app#/jobDetail?jobId=JOB-1')));
+});
+
+test('schedule ownership is validated and missing Amazon fields use honest fallbacks', async (t) => {
+  const sparseJob = { jobId: 'JOB-SPARSE' };
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      data: {
+        searchScheduleCards: {
+          scheduleCards: [
+            { scheduleId: 'S-VALID', jobId: 'JOB-SPARSE' },
+            { scheduleId: 'S-WRONG-PARENT', jobId: 'JOB-OTHER', scheduleText: 'Wrong job' },
+            { jobId: 'JOB-SPARSE', scheduleText: 'No schedule ID' },
+          ],
+          nextToken: null,
+        },
+      },
+    }),
+  });
+
+  const result = await harness.api.processDiscoveredJob(sparseJob, new Date().toISOString());
+  const alerts = harness.api.db.prepare('SELECT * FROM telegram_outbox').all();
+  assert.equal(result.count, 1);
   assert.equal(alerts.length, 1);
-  assert.deepEqual(JSON.parse(alerts[0].schedule_ids), ['S-1', 'S-2']);
-  assert.equal((alerts[0].message.match(/📋 Shift 1:/g) ?? []).length, 1);
-  assert.equal((alerts[0].message.match(/📋 Shift 2:/g) ?? []).length, 1);
+  assert.deepEqual(JSON.parse(alerts[0].schedule_ids), ['S-VALID']);
+  for (const fallback of [
+    'Location: Not supplied',
+    'Postcode: Not supplied',
+    'Job title: Not supplied',
+    'Contract type: Not supplied',
+    'Pay rate/range: Not supplied',
+    'First day: Not supplied',
+    'Schedule days and times: Not supplied',
+    'Hours per week: Not supplied',
+  ]) {
+    assert.ok(alerts[0].message.includes(fallback), `missing fallback ${fallback}`);
+  }
+  assert.doesNotMatch(alerts[0].message, /15\.10|20 hours|Upcoming|Working Days/);
+  assert.match(alerts[0].message, /jobDetail\?jobId=JOB-SPARSE/);
 });
 
 test('Telegram worker cycles do not overlap while a request is in flight', async (t) => {
@@ -93,7 +133,7 @@ test('Telegram worker cycles do not overlap while a request is in flight', async
   const responsePending = new Promise((resolve) => { resolveTelegram = resolve; });
   const harness = createScannerHarness(t, {
     scheduleResponder: async () => mockResponse({
-      data: { searchScheduleCards: { scheduleCards: [schedule('S-WORKER', 'Night shift')] } },
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-WORKER', 'Night shift')], nextToken: null } },
     }),
     telegramResponder: async () => {
       signalStarted();
@@ -122,7 +162,7 @@ test('Telegram worker cycles do not overlap while a request is in flight', async
 test('HTTP success with Telegram ok:false is retried, never marked sent, then fails safely', async (t) => {
   const harness = createScannerHarness(t, {
     scheduleResponder: async () => mockResponse({
-      data: { searchScheduleCards: { scheduleCards: [schedule('S-FAIL', 'Weekend shift')] } },
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-FAIL', 'Weekend shift')], nextToken: null } },
     }),
     telegramResponder: async () => mockResponse({ ok: false, description: 'rejected' }),
   });
@@ -154,10 +194,76 @@ test('HTTP success with Telegram ok:false is retried, never marked sent, then fa
   assert.equal(harness.telegramCalls.length, attempts);
 });
 
+test('Telegram HTTP 429 honors Retry-After and keeps the alert pending', async (t) => {
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-429', 'Day shift')], nextToken: null } },
+    }),
+    telegramResponder: async () => mockResponse(
+      { ok: false, description: 'rate limited' },
+      429,
+      { 'Retry-After': '75' },
+    ),
+  });
+  await harness.api.processDiscoveredJob(job, new Date().toISOString());
+  harness.api.startTelegramWorker();
+  await harness.intervals[0].callback();
+
+  const outbox = harness.api.db.prepare('SELECT * FROM telegram_outbox').get();
+  assert.equal(outbox.status, 'pending');
+  assert.equal(outbox.attempt_count, 1);
+  assert.ok(Date.parse(outbox.next_attempt_at) >= Date.now() + 74000);
+  assert.ok(Date.parse(outbox.next_attempt_at) <= Date.now() + 75000);
+  assert.equal(harness.telegramCalls.length, 1);
+});
+
+test('Telegram server errors remain pending with capped exponential retry', async (t) => {
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-500', 'Evening shift')], nextToken: null },
+      },
+    }),
+    telegramResponder: async () => mockResponse({ ok: false }, 500),
+  });
+  await harness.api.processDiscoveredJob(job, new Date().toISOString());
+  harness.api.startTelegramWorker();
+  const runCycle = harness.intervals[0].callback;
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    harness.api.db.prepare(
+      "UPDATE telegram_outbox SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = 1",
+    ).run();
+    await runCycle();
+  }
+  const outbox = harness.api.db.prepare('SELECT * FROM telegram_outbox').get();
+  assert.equal(outbox.status, 'pending');
+  assert.equal(outbox.attempt_count, 4);
+  assert.ok(outbox.next_attempt_at);
+});
+
+test('Telegram delivery continues independently while Amazon is in cooldown', async (t) => {
+  const harness = createScannerHarness(t, {
+    jobResponder: async () => mockResponse({}, 403),
+    scheduleResponder: async () => mockResponse({
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-DURING-COOLDOWN', 'Day shift')], nextToken: null },
+      },
+    }),
+  });
+  await harness.api.processDiscoveredJob(job, new Date().toISOString());
+  await harness.api.fetchAmazonJobFeed('Loop-1');
+  assert.equal(harness.api.getAmazonProtectionState().blocked, true);
+
+  harness.api.startTelegramWorker();
+  await harness.intervals[0].callback();
+
+  assert.equal(harness.telegramCalls.length, 1);
+  assert.equal(harness.api.db.prepare('SELECT status FROM telegram_outbox').get().status, 'sent');
+});
+
 test('failed network delivery is recorded and retried only after backoff', async (t) => {
   const harness = createScannerHarness(t, {
     scheduleResponder: async () => mockResponse({
-      data: { searchScheduleCards: { scheduleCards: [schedule('S-NET', 'Day shift')] } },
+      data: { searchScheduleCards: { scheduleCards: [schedule('S-NET', 'Day shift')], nextToken: null } },
     }),
     telegramResponder: async () => {
       throw new Error('mock network failure');
@@ -210,7 +316,7 @@ test('job discovery, queue, and Telegram timestamps are ISO 8601 and latencies p
     scheduleResponder: async () => mockResponse({
       data: {
         searchScheduleCards: {
-          scheduleCards: [schedule('S-TIMESTAMP', 'Timestamped shift')],
+          scheduleCards: [{ ...schedule('S-TIMESTAMP', 'Timestamped shift'), jobId: 'JOB-TIMESTAMP' }],
           nextToken: null,
         },
       },

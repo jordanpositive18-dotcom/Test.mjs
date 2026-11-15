@@ -67,6 +67,7 @@ globalThis.__testApi = {
   fetchAmazonJobFeed,
   fetchSchedulesForJob,
   processDiscoveredJob,
+  runCoordinatedScannerPass,
   runScannerLoop,
   runTelegramWorkerCycle,
   startTelegramWorker,
