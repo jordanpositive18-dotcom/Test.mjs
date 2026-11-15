@@ -1,18 +1,23 @@
 # Telegram notification delivery
 
 New schedules are deduplicated in `discovered_schedules`. Only schedule IDs
-inserted for the first time are included in an alert. All newly discovered
-schedules from one job pass are formatted into one message and one outbox row,
-inserted in the same SQLite transaction. A unique notification key prevents
-the same group from being inserted twice. The outbox migration adds columns and
-an index without dropping existing records.
+inserted for the first time are included in an alert. Each verified schedule is
+formatted as its own message and outbox row in the same SQLite transaction.
+The schedule ID is the notification key, so the unique index prevents a second
+outbox record for that schedule. Schedules with a missing ID or a job ID that
+does not match the parent job are rejected. Missing alert fields are labelled
+"Not supplied"; the alert does not invent pay, hours, contract details, or
+schedule times. Existing grouped outbox rows are preserved and remain
+deliverable. The additive migration does not remove existing records.
 
 The Telegram worker drains up to five due notifications per cycle, and a
 single-flight guard prevents its timer from starting another cycle while one is
 running. Each row is claimed before sending and marked `sent` only when the HTTP
-response succeeds and Telegram returns JSON with `ok: true`. Failures retry
-after five seconds and then ten seconds; after three total attempts the row is
-marked `failed` and is not automatically retried. The attempt count and last
+response succeeds and Telegram returns JSON with `ok: true`. Network errors and
+HTTP 5xx responses retry with capped exponential backoff and stay pending until
+delivery succeeds. HTTP 429 uses `Retry-After` when present (including
+Telegram's JSON retry hint), otherwise a 60-second delay. Other non-retryable
+rejections are marked `failed` after three attempts. The attempt count and last
 error remain recorded. A one-minute claim expiry recovers work left processing
 by a stopped process.
 

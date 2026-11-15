@@ -120,7 +120,7 @@ const stmtUpdateQueueTime = db.prepare(`
 const stmtEnqueueTelegram = db.prepare(`
   INSERT OR IGNORE INTO telegram_outbox
     (schedule_id, notification_key, schedule_ids, message, status, created_at)
-  VALUES (?, ?, ?, ?, 'pending', datetime('now'))
+  VALUES (?, ?, ?, ?, 'pending', ?)
 `);
 
 const stmtGetPendingAlerts = db.prepare(`
@@ -217,10 +217,15 @@ const AMAZON_PROTECTION_RECOVERY_TEMP = `${AMAZON_PROTECTION_RECOVERY_MARKER}.tm
 const AMAZON_PROTECTION_UNKNOWN_EXPIRY = '9999-12-31T23:59:59.999Z';
 const AMAZON_PROTECTION_CLEAR_EXPIRY = '1970-01-01T00:00:00.000Z';
 const activeAmazonControllers = new Set();
+const inFlightScheduleRequests = new Map();
+const blockedAmazonLogAt = new Map();
 let pendingProtectionWrite = null;
 let protectionStateUnavailable = false;
 let protectionStateInitialized = false;
 let allowProtectionBootstrap = !protectionTableExistedBeforeMigration;
+let amazonRecoveryOwner = null;
+let amazonRecoveryGenerationId = null;
+let recoveredCooldownExpiry = null;
 
 function protectionReasonPriority(reason) {
   if (reason === 'protection_state_unknown') return 100;
@@ -434,6 +439,9 @@ function abortOtherAmazonRequests(exceptController, reason) {
 }
 
 function activateAmazonCooldown(reason, durationMs, loopName, operation, controller, status = 'none') {
+  amazonRecoveryOwner = null;
+  amazonRecoveryGenerationId = null;
+  recoveredCooldownExpiry = null;
   const now = Date.now();
   const candidate = {
     reason,
@@ -542,11 +550,43 @@ function amazonFailureCooldown(response) {
 async function protectedAmazonFetch(operation, loopName, url, options) {
   const before = getAmazonProtectionState();
   if (before.blocked) {
-    console.warn(
-      `[AmazonRequest] loop=${loopName} operation=${operation} status=none durationMs=0 `
-      + `cooldownReason=${before.reason} cooldownExpiresAt=${before.expiresAt ?? 'unknown'} `
-      + `scan=BLOCKED`,
+    const logKey = `${operation}:${before.reason}`;
+    const lastLoggedAt = blockedAmazonLogAt.get(logKey) ?? 0;
+    if (Date.now() - lastLoggedAt >= 60000) {
+      blockedAmazonLogAt.set(logKey, Date.now());
+      console.warn(
+        `[AmazonRequest] loop=${loopName} operation=${operation} status=none durationMs=0 `
+        + `cooldownReason=${before.reason} cooldownExpiresAt=${before.expiresAt ?? 'unknown'} `
+        + `scan=BLOCKED (repeated blocked logs suppressed for 60s)`,
+      );
+    }
+    return null;
+  }
+  const priorExpiry = Date.parse(before.expiresAt ?? '');
+  if (!amazonRecoveryOwner
+    && before.reason
+    && before.reason !== 'none'
+    && Number.isFinite(priorExpiry)
+    && priorExpiry <= Date.now()
+    && before.expiresAt !== recoveredCooldownExpiry) {
+    amazonRecoveryOwner = loopName;
+    amazonRecoveryGenerationId = sharedScannerGeneration?.id ?? null;
+    recoveredCooldownExpiry = before.expiresAt;
+    console.log(
+      `[AmazonRequest] cooldown recovery assigned to ${loopName}; `
+      + `other loops will resume on the next shared scan generation`,
     );
+  }
+  if (amazonRecoveryOwner && amazonRecoveryOwner !== loopName) {
+    const logKey = `recovery-owner:${operation}`;
+    const lastLoggedAt = blockedAmazonLogAt.get(logKey) ?? 0;
+    if (Date.now() - lastLoggedAt >= 60000) {
+      blockedAmazonLogAt.set(logKey, Date.now());
+      console.log(
+        `[AmazonRequest] loop=${loopName} operation=${operation} `
+        + `scan=PARTIAL recoveryOwner=${amazonRecoveryOwner}; request not queued`,
+      );
+    }
     return null;
   }
 
@@ -690,18 +730,45 @@ reconcileAmazonProtectionState();
 
 function recordTelegramFailure(alert, error) {
   const attemptCount = alert.attempt_count;
-  const terminal = attemptCount >= TELEGRAM_MAX_ATTEMPTS;
-  const retryDelay = Math.min(
-    TELEGRAM_RETRY_BASE_MS * (2 ** Math.max(0, attemptCount - 1)),
-    TELEGRAM_RETRY_MAX_MS,
-  );
+  const retryable = error?.retryable !== false;
+  const terminal = !retryable && attemptCount >= TELEGRAM_MAX_ATTEMPTS;
+  const retryDelay = Number.isFinite(error?.retryAfterMs)
+    ? Math.max(0, error.retryAfterMs)
+    : Math.min(
+      TELEGRAM_RETRY_BASE_MS * (2 ** Math.max(0, attemptCount - 1)),
+      TELEGRAM_RETRY_MAX_MS,
+    );
   const retryAt = terminal ? null : new Date(Date.now() + retryDelay).toISOString();
-  const message = String(error?.message ?? error).slice(0, 500);
+  const message = safeAmazonDiagnosticText(error?.message ?? error).slice(0, 240);
   stmtMarkAlertFailed.run(terminal ? 'failed' : 'pending', retryAt, message, alert.id);
   console.error(
     `[Telegram] ${terminal ? '❌ Permanently failed' : '⚠️ Retry scheduled'} `
-    + `for outbox record ${alert.id} (attempt ${attemptCount}/${TELEGRAM_MAX_ATTEMPTS}): ${message}`,
+    + `for outbox record ${alert.id} (attempt ${attemptCount}`
+    + `${retryable ? '' : `/${TELEGRAM_MAX_ATTEMPTS}`}, retryable=${retryable}): ${message}`,
   );
+}
+
+function parseTelegramRetryAfter(response, payload) {
+  const headerDelay = parseRetryAfterMs(response);
+  if (headerDelay !== null) return headerDelay;
+
+  const seconds = payload?.parameters?.retry_after;
+  if (Number.isFinite(Number(seconds)) && Number(seconds) >= 0) {
+    return Math.ceil(Number(seconds) * 1000);
+  }
+  return 60000;
+}
+
+function createTelegramResponseError(response, payload) {
+  const status = response.status;
+  const description = typeof payload?.description === 'string'
+    ? `: ${safeAmazonDiagnosticText(payload.description).slice(0, 200)}`
+    : '';
+  const error = new Error(`Telegram rejected the message (HTTP ${status})${description}`);
+  error.status = status;
+  error.retryable = status === 429 || status >= 500;
+  if (status === 429) error.retryAfterMs = parseTelegramRetryAfter(response, payload);
+  return error;
 }
 
 async function runTelegramWorkerCycle() {
@@ -735,14 +802,18 @@ async function runTelegramWorkerCycle() {
         try {
           telegramPayload = await res.json();
         } catch {
-          throw new Error(`Telegram returned invalid JSON (HTTP ${res.status})`);
+          const error = new Error(`Telegram returned invalid JSON (HTTP ${res.status})`);
+          error.status = res.status;
+          error.retryable = res.status === 429
+            || res.status >= 500
+            || (res.status >= 200 && res.status < 300)
+            || res.status < 200;
+          if (res.status === 429) error.retryAfterMs = parseTelegramRetryAfter(res, null);
+          throw error;
         }
 
         if (!res.ok || telegramPayload?.ok !== true) {
-          const description = typeof telegramPayload?.description === 'string'
-            ? `: ${telegramPayload.description.slice(0, 300)}`
-            : '';
-          throw new Error(`Telegram rejected the message (HTTP ${res.status})${description}`);
+          throw createTelegramResponseError(res, telegramPayload);
         }
 
         stmtMarkAlertSent.run(alert.id);
@@ -839,11 +910,12 @@ function reportAmazonHttpFailure(operation, response, pageCount, jobId) {
 }
 
 // --- FETCH SCHEDULE CARDS WITH FULL PAGINATION (`nextToken` Crawler) ---
-async function fetchSchedulesForJob(jobId, loopName = 'Loop-unknown') {
+async function fetchSchedulesForJobUncoordinated(jobId, loopName = 'Loop-unknown') {
   let allSchedules = [];
   let nextToken = null;
   let pageCount = 0;
   let paginationComplete = true;
+  const seenScheduleIds = new Set();
   const maxPages = 5;
 
   do {
@@ -909,8 +981,20 @@ async function fetchSchedulesForJob(jobId, loopName = 'Loop-unknown') {
         break;
       }
       const resultData = data?.data?.searchScheduleCards;
-      if (resultData && resultData.scheduleCards) {
-        allSchedules.push(...resultData.scheduleCards);
+      if (!resultData || !Array.isArray(resultData.scheduleCards)
+        || !Object.hasOwn(resultData, 'nextToken')
+        || (resultData.nextToken !== null && typeof resultData.nextToken !== 'string')) {
+        console.warn(`[Scan Health] PARTIAL: malformed Amazon schedule response on page ${pageCount} for job ${safeAmazonDiagnosticText(jobId)}.`);
+        paginationComplete = false;
+        break;
+      }
+      for (const schedule of resultData.scheduleCards) {
+        if (typeof schedule?.scheduleId === 'string'
+          && schedule.scheduleId.length > 0
+          && !seenScheduleIds.has(schedule.scheduleId)) {
+          seenScheduleIds.add(schedule.scheduleId);
+          allSchedules.push(schedule);
+        }
       }
       nextToken = resultData?.nextToken || null;
       if (Array.isArray(data?.errors) && data.errors.length > 0) {
@@ -936,13 +1020,68 @@ async function fetchSchedulesForJob(jobId, loopName = 'Loop-unknown') {
   return { schedules: allSchedules, paginationComplete };
 }
 
+function fetchSchedulesForJob(jobId, loopName = 'Loop-unknown') {
+  if (typeof jobId !== 'string' || jobId.length === 0) {
+    return Promise.resolve({ schedules: [], paginationComplete: false });
+  }
+  const existing = inFlightScheduleRequests.get(jobId);
+  if (existing) return existing;
+
+  const request = Promise.resolve()
+    .then(() => fetchSchedulesForJobUncoordinated(jobId, loopName))
+    .finally(() => {
+      if (inFlightScheduleRequests.get(jobId) === request) {
+        inFlightScheduleRequests.delete(jobId);
+      }
+    });
+  inFlightScheduleRequests.set(jobId, request);
+  return request;
+}
+
+function displayAlertValue(value) {
+  if (value === null || value === undefined || String(value).trim() === '') {
+    return 'Not supplied';
+  }
+  return String(value).trim();
+}
+
+function formatScheduleAlert(job, schedule) {
+  const pay = job.totalPayRateMax ?? job.totalPayRateMin ?? job.payRate;
+  let payText = 'Not supplied';
+  if (pay !== null && pay !== undefined && String(pay).trim() !== '') {
+    const rawPay = String(pay).trim();
+    payText = /[£$€]/.test(rawPay) ? rawPay : `£${rawPay} (maximum supplied)`;
+  }
+  const location = job.locationName ?? job.city;
+  const firstDay = schedule.firstDayOnSiteL10N ?? schedule.firstDayOnSite;
+  const applicationUrl = `https://www.jobsatamazon.co.uk/app#/jobDetail?jobId=${encodeURIComponent(job.jobId)}`;
+
+  return [
+    '🔔 Amazon Shift Alert',
+    `📍 Location: ${displayAlertValue(location)}`,
+    `📮 Postcode: ${displayAlertValue(job.postalCode)}`,
+    `💼 Job title: ${displayAlertValue(job.jobTitle)}`,
+    `📝 Contract type: ${displayAlertValue(schedule.scheduleType ?? job.contractType)}`,
+    `💰 Pay rate/range: ${payText}`,
+    `📅 First day: ${displayAlertValue(firstDay)}`,
+    `🕒 Schedule days and times: ${displayAlertValue(schedule.scheduleText)}`,
+    `⏱️ Hours per week: ${displayAlertValue(schedule.hoursPerWeek)}`,
+    `🔗 Apply: ${applicationUrl}`,
+  ].join('\n');
+}
+
 // --- CORE JOB & SCHEDULE PROCESSOR ---
 async function processDiscoveredJob(job, amazonDetectedAt, loopName = 'Loop-unknown') {
+  if (!job || typeof job.jobId !== 'string' || job.jobId.length === 0) {
+    return { count: 0, scheduleIds: [], paginationComplete: false };
+  }
   const { schedules: scheduleCards, paginationComplete } = await fetchSchedulesForJob(job.jobId, loopName);
   const queued = db.transaction(() => {
     const newlyDiscovered = [];
     for (const card of scheduleCards) {
-      if (!card?.scheduleId) continue;
+      if (typeof card?.scheduleId !== 'string'
+        || card.scheduleId.length === 0
+        || card.jobId !== job.jobId) continue;
       const result = stmtClaimSchedule.run(card.scheduleId, amazonDetectedAt, amazonDetectedAt);
       if (result.changes === 1) newlyDiscovered.push(card);
     }
@@ -950,41 +1089,24 @@ async function processDiscoveredJob(job, amazonDetectedAt, loopName = 'Loop-unkn
     if (newlyDiscovered.length === 0) return { count: 0, scheduleIds: [] };
 
     const queuedAt = new Date().toISOString();
-    const locationName = job.locationName || job.city || 'UK Delivery Station';
-    const postalCode = job.postalCode || '';
-    const title = job.jobTitle || 'Delivery Station Warehouse Associate';
-    const payRate = job.totalPayRateMax ? job.totalPayRateMax.toString() : '15.10';
-    const shiftCount = newlyDiscovered.length;
-
-    let message = `📍 ${locationName} ${postalCode}\n` +
-                  `🏷️ ${title} | ${shiftCount}\n` +
-                  `💼 Seasonal | Full-time;Part-time\n` +
-                  `💰 £${payRate} /hr\n`;
-
-    newlyDiscovered.forEach((shift, index) => {
-      message += `\n📋 Shift ${index + 1}:\n` +
-                 `📅 First Day: ${shift.firstDayOnSiteL10N || shift.firstDayOnSite || 'Upcoming'}\n` +
-                 `⏰ Schedule: ${shift.scheduleText || 'Working Days'}\n` +
-                 `🕐 Hours/Week: ${shift.hoursPerWeek || '20'}\n`;
-    });
-
-    const scheduleIds = newlyDiscovered.map(({ scheduleId }) => scheduleId).sort();
-    const notificationKey = JSON.stringify([job.jobId, scheduleIds]);
-    for (const scheduleId of scheduleIds) {
+    const scheduleIds = [];
+    for (const shift of newlyDiscovered) {
+      const scheduleId = shift.scheduleId;
+      const notificationKey = scheduleId;
+      const inserted = stmtEnqueueTelegram.run(
+        scheduleId,
+        notificationKey,
+        JSON.stringify([scheduleId]),
+        formatScheduleAlert(job, shift),
+        queuedAt,
+      );
+      if (inserted.changes !== 1) continue;
       stmtUpdateQueueTime.run(queuedAt, scheduleId);
+      scheduleIds.push(scheduleId);
     }
-    stmtEnqueueTelegram.run(
-      scheduleIds[0],
-      notificationKey,
-      JSON.stringify(scheduleIds),
-      message,
-    );
 
-    console.log(
-      `[DEDUP] Queued one grouped alert for job ${job.jobId} `
-      + `with ${shiftCount} newly discovered shift(s) at ${queuedAt}`,
-    );
-    return { count: shiftCount, scheduleIds };
+    console.log(`[DEDUP] Queued ${scheduleIds.length} individual schedule alert(s) for job ${job.jobId} at ${queuedAt}`);
+    return { count: scheduleIds.length, scheduleIds };
   }).immediate();
 
   return { ...queued, paginationComplete };
@@ -993,6 +1115,7 @@ async function processDiscoveredJob(job, amazonDetectedAt, loopName = 'Loop-unkn
 // --- FULL NATIONWIDE FEED FETCHER WITH PAGINATION & SCAN HEALTH TRACKING ---
 async function fetchAmazonJobFeed(loopName = 'Loop-unknown') {
   let allJobCards = [];
+  const seenJobIds = new Set();
   let nextToken = null;
   let pageCount = 0;
   let scanStatus = 'COMPLETE';
@@ -1070,8 +1193,20 @@ async function fetchAmazonJobFeed(loopName = 'Loop-unknown') {
       }
 
       const resultData = data?.data?.searchJobCardsByLocation;
-      if (resultData && resultData.jobCards) {
-        for (const job of resultData.jobCards) {
+      if (!resultData || !Array.isArray(resultData.jobCards)
+        || !Object.hasOwn(resultData, 'nextToken')
+        || (resultData.nextToken !== null && typeof resultData.nextToken !== 'string')) {
+        console.warn(`[Scan Health] PARTIAL: malformed Amazon job response on page ${pageCount}.`);
+        scanStatus = 'PARTIAL';
+        break;
+      }
+      for (const job of resultData.jobCards) {
+        if (!job || typeof job.jobId !== 'string' || job.jobId.length === 0) {
+          scanStatus = 'PARTIAL';
+          continue;
+        }
+        if (!seenJobIds.has(job.jobId)) {
+          seenJobIds.add(job.jobId);
           allJobCards.push({
             ...job,
             _scannerDetectedAt: new Date().toISOString(),
@@ -1108,32 +1243,115 @@ async function randomizedDelay() {
   await new Promise(resolve => setTimeout(resolve, jitter));
 }
 
-// --- MAIN OVERLAPPING SCANNER LOOP ---
+const SCANNER_LOOP_NAMES = ['Loop-1', 'Loop-2', 'Loop-3'];
+let sharedScannerGeneration = null;
+let scannerGenerationSequence = 0;
+
+function scannerLoopIndex(loopName) {
+  const match = /^Loop-([123])$/.exec(loopName);
+  return match ? Number(match[1]) - 1 : 0;
+}
+
+function createScannerGeneration(loopName) {
+  let resolveCompletion;
+  const generation = {
+    id: ++scannerGenerationSequence,
+    participants: new Set(),
+    completedLoops: new Set(),
+    requiredLoops: SCANNER_LOOP_NAMES.includes(loopName) ? SCANNER_LOOP_NAMES : [loopName],
+    completion: new Promise((resolve) => { resolveCompletion = resolve; }),
+    feedPromise: null,
+  };
+  generation.resolveCompletion = resolveCompletion;
+  generation.feedPromise = Promise.resolve().then(() => fetchAmazonJobFeed(loopName));
+  sharedScannerGeneration = generation;
+  return generation;
+}
+
+async function acquireScannerGeneration(loopName) {
+  while (true) {
+    const generation = sharedScannerGeneration || createScannerGeneration(loopName);
+    if (generation.participants.has(loopName)) {
+      await generation.completion;
+      continue;
+    }
+    generation.participants.add(loopName);
+    let feed;
+    try {
+      feed = await generation.feedPromise;
+    } catch (error) {
+      console.error(`[Scan Health] Shared job feed failed: ${safeAmazonDiagnosticText(error?.message)}`);
+      feed = { jobCards: [], scanStatus: 'PARTIAL' };
+    }
+    const loopIndex = scannerLoopIndex(loopName);
+    const assignedJobs = (feed.jobCards ?? []).filter((_, index) => index % 3 === loopIndex);
+    return { generation, feed, assignedJobs };
+  }
+}
+
+function completeScannerGeneration(generation, loopName) {
+  generation.completedLoops.add(loopName);
+  if (generation.requiredLoops.every((name) => generation.completedLoops.has(name))) {
+    if (amazonRecoveryGenerationId === generation.id) {
+      amazonRecoveryOwner = null;
+      amazonRecoveryGenerationId = null;
+    }
+    if (sharedScannerGeneration === generation) sharedScannerGeneration = null;
+    generation.resolveCompletion();
+  }
+}
+
+async function runCoordinatedScannerPass(loopName) {
+  const lease = await acquireScannerGeneration(loopName);
+  let completedScanStatus = lease.feed.scanStatus;
+  const discoveredJobIds = [];
+  try {
+    if (completedScanStatus !== 'BLOCKED') {
+      for (const job of lease.assignedJobs) {
+        try {
+          const result = await processDiscoveredJob(job, job._scannerDetectedAt, loopName);
+          discoveredJobIds.push(job.jobId);
+          completedScanStatus = includeSchedulePaginationStatus(
+            completedScanStatus,
+            result.paginationComplete,
+          );
+        } catch (error) {
+          completedScanStatus = completedScanStatus === 'BLOCKED' ? 'BLOCKED' : 'PARTIAL';
+          console.error(
+            `[${loopName}] Job ${safeAmazonDiagnosticText(job?.jobId)} processing failed: `
+            + `${safeAmazonDiagnosticText(error?.message)}`,
+          );
+        }
+      }
+    }
+    console.log(
+      `[Scan Health] [${loopName}] Scan completed with status: `
+      + `[${completedScanStatus}] | Feed generation ${lease.generation.id} retrieved `
+      + `${lease.feed.jobCards?.length ?? 0} nationwide job card(s); this loop processed `
+      + `${discoveredJobIds.length}.`,
+    );
+    return {
+      generationId: lease.generation.id,
+      scanStatus: completedScanStatus,
+      retrievedJobCount: lease.feed.jobCards?.length ?? 0,
+      assignedJobCount: lease.assignedJobs.length,
+      discoveredJobIds,
+    };
+  } finally {
+    completeScannerGeneration(lease.generation, loopName);
+  }
+}
+
+// --- THREE COORDINATED NATIONWIDE SCANNER LOOPS ---
 async function runScannerLoop(loopName) {
   console.log(`[${loopName}] Started nationwide feed scanning loop.`);
 
   while (true) {
     try {
-      const { jobCards, scanStatus } = await fetchAmazonJobFeed(loopName);
-      let completedScanStatus = scanStatus;
-
-      if (scanStatus !== 'BLOCKED' && jobCards && jobCards.length > 0) {
-        for (const job of jobCards) {
-          const result = await processDiscoveredJob(job, job._scannerDetectedAt, loopName);
-          completedScanStatus = includeSchedulePaginationStatus(
-            completedScanStatus,
-            result.paginationComplete,
-          );
-        }
-      }
-
-      console.log(
-        `[Scan Health] [${loopName}] Scan completed with status: `
-        + `[${completedScanStatus}] | Retrieved ${jobCards.length} job card(s).`,
-      );
+      await runCoordinatedScannerPass(loopName);
       await randomizedDelay();
     } catch (err) {
-      console.error(`[${loopName}] ⚠️ Loop error:`, err.message);
+      console.error(`[${loopName}] ⚠️ Loop error:`, safeAmazonDiagnosticText(err?.message));
       await new Promise(resolve => setTimeout(resolve, 10000));
     }
   }
@@ -1148,7 +1366,7 @@ function includeSchedulePaginationStatus(scanStatus, paginationComplete) {
 console.log('[Bot] Starting Amazon Shift Tracker (Production Telemetry & Pagination Edition)...');
 console.log('[Activation] Runtime: Node.js ES Modules | Database: better-sqlite3 | Pagination: Active nextToken Crawler');
 console.log('[Bot] Targets: Nationwide UK Feed Scans with Scan Health Tracking & Latency Telemetry');
-console.log('[Watchdog] Started - monitoring 3 global overlapping loops with staggered delays.');
+console.log('[Watchdog] Started - coordinating 3 nationwide scanner loops with staggered delays.');
 
 startTelegramWorker();
 

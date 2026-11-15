@@ -11,6 +11,22 @@ accepting its response. Its abort controller remains registered through JSON bod
 reading. The 30-second deadline covers both headers and body. Aborted or blocked
 responses do not reach job/schedule accumulation or notification enqueueing.
 
+## Three-loop scan coordination
+
+The existing three loops and their 0/5/10-second startup timing remain. A shared
+scan generation fetches and paginates the nationwide job feed once. The complete
+deduplicated result is shared among the loops; each loop processes a distinct
+index-based subset of jobs for schedule discovery. Schedule requests for the
+same job are coalesced while in flight. A new generation cannot start until all
+three loops finish the current one, so the loops do not trigger duplicate feed
+polls or accumulate a request backlog.
+
+When a stored cooldown has just expired, only the loop that starts the first
+recovery generation may issue Amazon requests in that generation. The other
+loops' schedule attempts are dropped rather than queued and are retried in the
+next shared generation. This avoids a synchronized three-loop request burst
+without changing the normal 3–5-second loop delay.
+
 ## Durable recovery
 
 The recovery files live beside the existing SQLite file:

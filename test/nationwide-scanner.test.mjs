@@ -24,6 +24,225 @@ test('exactly three independent nationwide loops retain their 5s and 10s startup
   assert.match(source, /runScannerLoop\('Loop-3'\);\s*\},\s*10000\)/);
 });
 
+test('three loops share each nationwide feed and process distinct schedule work', async (t) => {
+  const jobs = Array.from({ length: 6 }, (_, index) => ({
+    ...jobSource,
+    jobId: `JOB-SHARED-${index + 1}`,
+  }));
+  const harness = createScannerHarness(t, {
+    jobResponder: async () => mockResponse({
+      data: { searchJobCardsByLocation: { jobCards: jobs, nextToken: null } },
+    }),
+    scheduleResponder: async (call) => mockResponse({
+      data: {
+        searchScheduleCards: {
+          scheduleCards: [{
+            scheduleId: `S-${call.body.variables.searchScheduleRequest.jobId}`,
+            jobId: call.body.variables.searchScheduleRequest.jobId,
+          }],
+          nextToken: null,
+        },
+      },
+    }),
+  });
+
+  const results = await Promise.all([
+    harness.api.runCoordinatedScannerPass('Loop-1'),
+    harness.api.runCoordinatedScannerPass('Loop-2'),
+    harness.api.runCoordinatedScannerPass('Loop-3'),
+  ]);
+
+  assert.equal(harness.amazonCalls.filter(({ body }) => body.query.includes('searchJobCardsByLocation')).length, 1);
+  assert.equal(harness.amazonCalls.filter(({ body }) => body.query.includes('searchScheduleCards')).length, 6);
+  assert.equal(new Set(results.map((result) => result.generationId)).size, 1);
+  assert.ok(results.every((result) => result.retrievedJobCount === 6));
+  assert.deepEqual(results.map((result) => result.assignedJobCount), [2, 2, 2]);
+  const processedJobIds = results.flatMap((result) => result.discoveredJobIds);
+  assert.equal(new Set(processedJobIds).size, 6);
+  assert.deepEqual(new Set(processedJobIds), new Set(jobs.map(({ jobId }) => jobId)));
+});
+
+test('simultaneous schedule requests for one job share a single Amazon request', async (t) => {
+  let releaseResponse;
+  let requestStarted;
+  const started = new Promise((resolve) => { requestStarted = resolve; });
+  const response = new Promise((resolve) => { releaseResponse = resolve; });
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async () => {
+      requestStarted();
+      return response;
+    },
+  });
+  const first = harness.api.fetchSchedulesForJob('JOB-ONE-FLIGHT', 'Loop-1');
+  await started;
+  const second = harness.api.fetchSchedulesForJob('JOB-ONE-FLIGHT', 'Loop-2');
+  releaseResponse(mockResponse({
+    data: {
+      searchScheduleCards: {
+        scheduleCards: [{ scheduleId: 'S-ONE-FLIGHT', jobId: 'JOB-ONE-FLIGHT' }],
+        nextToken: null,
+      },
+    },
+  }));
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.equal(harness.amazonCalls.length, 1);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(firstResult.schedules)),
+    JSON.parse(JSON.stringify(secondResult.schedules)),
+  );
+});
+
+test('an incomplete schedule response on one loop does not stop other loop work', async (t) => {
+  const jobs = Array.from({ length: 3 }, (_, index) => ({
+    ...jobSource,
+    jobId: `JOB-ISOLATED-${index + 1}`,
+  }));
+  const harness = createScannerHarness(t, {
+    jobResponder: async () => mockResponse({
+      data: { searchJobCardsByLocation: { jobCards: jobs, nextToken: null } },
+    }),
+    scheduleResponder: async (call) => {
+      const jobId = call.body.variables.searchScheduleRequest.jobId;
+      if (jobId === 'JOB-ISOLATED-1') return mockResponse({ data: {} });
+      return mockResponse({
+        data: {
+          searchScheduleCards: {
+            scheduleCards: [{ scheduleId: `S-${jobId}`, jobId }],
+            nextToken: null,
+          },
+        },
+      });
+    },
+  });
+
+  const results = await Promise.all([
+    harness.api.runCoordinatedScannerPass('Loop-1'),
+    harness.api.runCoordinatedScannerPass('Loop-2'),
+    harness.api.runCoordinatedScannerPass('Loop-3'),
+  ]);
+  assert.deepEqual(results.map(({ scanStatus }) => scanStatus), ['PARTIAL', 'COMPLETE', 'COMPLETE']);
+  assert.equal(harness.api.db.prepare('SELECT COUNT(*) AS count FROM discovered_schedules').get().count, 2);
+  assert.equal(harness.amazonCalls.filter(({ body }) => body.query.includes('searchScheduleCards')).length, 3);
+});
+
+test('malformed successful GraphQL responses are marked partial, not empty-successful', async (t) => {
+  const jobHarness = createScannerHarness(t, {
+    jobResponder: async () => mockResponse({ data: { unrelated: {} } }),
+  });
+  const jobResult = await jobHarness.api.fetchAmazonJobFeed();
+  assert.equal(jobResult.scanStatus, 'PARTIAL');
+  assert.deepEqual(JSON.parse(JSON.stringify(jobResult.jobCards)), []);
+
+  const scheduleHarness = createScannerHarness(t, {
+    scheduleResponder: async () => mockResponse({ data: { searchScheduleCards: { scheduleCards: [] } } }),
+  });
+  const scheduleResult = await scheduleHarness.api.fetchSchedulesForJob(jobSource.jobId);
+  assert.equal(scheduleResult.paginationComplete, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(scheduleResult.schedules)), []);
+});
+
+test('duplicate job cards across changing pagination pages are processed once per feed', async (t) => {
+  const harness = createScannerHarness(t, {
+    jobResponder: async (_call, page) => mockResponse({
+      data: {
+        searchJobCardsByLocation: {
+          jobCards: page === 1
+            ? [jobSource]
+            : [{ ...jobSource, jobTitle: 'Updated title' }],
+          nextToken: page === 1 ? 'page-2' : null,
+        },
+      },
+    }),
+  });
+  const result = await harness.api.fetchAmazonJobFeed();
+  assert.equal(result.scanStatus, 'COMPLETE');
+  assert.equal(result.jobCards.length, 1);
+  assert.equal(result.jobCards[0].jobTitle, 'Fulfillment Associate');
+  assert.equal(harness.amazonCalls.length, 2);
+});
+
+test('duplicate schedule IDs across paginated results create one schedule record and alert', async (t) => {
+  const harness = createScannerHarness(t, {
+    scheduleResponder: async (_call, page) => mockResponse({
+      data: {
+        searchScheduleCards: {
+          scheduleCards: page === 1
+            ? [
+              { scheduleId: 'S-PAGE-DUP', jobId: jobSource.jobId },
+              { scheduleId: 'S-PAGE-1', jobId: jobSource.jobId },
+            ]
+            : [
+              { scheduleId: 'S-PAGE-DUP', jobId: jobSource.jobId },
+              { scheduleId: 'S-PAGE-2', jobId: jobSource.jobId },
+            ],
+          nextToken: page === 1 ? 'schedule-page-2' : null,
+        },
+      },
+    }),
+  });
+
+  const result = await harness.api.processDiscoveredJob(jobSource, new Date().toISOString());
+  assert.equal(result.count, 3);
+  assert.equal(harness.api.db.prepare('SELECT COUNT(*) AS count FROM discovered_schedules').get().count, 3);
+  assert.equal(harness.api.db.prepare('SELECT COUNT(*) AS count FROM telegram_outbox').get().count, 3);
+  assert.equal(harness.amazonCalls.length, 2);
+});
+
+test('post-cooldown recovery starts one loop first, then resumes all loops next generation', async (t) => {
+  const jobs = Array.from({ length: 3 }, (_, index) => ({
+    ...jobSource,
+    jobId: `JOB-RECOVERY-${index + 1}`,
+  }));
+  const harness = createScannerHarness(t, {
+    prepareDatabase(db) {
+      db.exec(`
+        CREATE TABLE amazon_request_protection (
+          id INTEGER PRIMARY KEY, reason TEXT NOT NULL, expires_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+      `);
+      db.prepare(`
+        INSERT INTO amazon_request_protection (id, reason, expires_at, updated_at)
+        VALUES (1, 'http_403', ?, ?)
+      `).run(
+        new Date(Date.now() - 10000).toISOString(),
+        new Date(Date.now() - 90000).toISOString(),
+      );
+    },
+    jobResponder: async () => mockResponse({
+      data: { searchJobCardsByLocation: { jobCards: jobs, nextToken: null } },
+    }),
+    scheduleResponder: async (call) => mockResponse({
+      data: {
+        searchScheduleCards: {
+          scheduleCards: [{
+            scheduleId: `S-${call.body.variables.searchScheduleRequest.jobId}`,
+            jobId: call.body.variables.searchScheduleRequest.jobId,
+          }],
+          nextToken: null,
+        },
+      },
+    }),
+  });
+
+  await Promise.all([
+    harness.api.runCoordinatedScannerPass('Loop-1'),
+    harness.api.runCoordinatedScannerPass('Loop-2'),
+    harness.api.runCoordinatedScannerPass('Loop-3'),
+  ]);
+  assert.equal(harness.amazonCalls.filter(({ body }) => body.query.includes('searchJobCardsByLocation')).length, 1);
+  assert.equal(harness.amazonCalls.filter(({ body }) => body.query.includes('searchScheduleCards')).length, 1);
+
+  await Promise.all([
+    harness.api.runCoordinatedScannerPass('Loop-1'),
+    harness.api.runCoordinatedScannerPass('Loop-2'),
+    harness.api.runCoordinatedScannerPass('Loop-3'),
+  ]);
+  assert.equal(harness.amazonCalls.filter(({ body }) => body.query.includes('searchJobCardsByLocation')).length, 2);
+  assert.equal(harness.amazonCalls.filter(({ body }) => body.query.includes('searchScheduleCards')).length, 4);
+  assert.equal(harness.api.db.prepare('SELECT COUNT(*) AS count FROM discovered_schedules').get().count, 3);
+});
+
 test('job feed preserves Amazon request URL, query, variables and headers', async (t) => {
   const harness = createScannerHarness(t, {
     jobResponder: async () => mockResponse({
